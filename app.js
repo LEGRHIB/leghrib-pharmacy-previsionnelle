@@ -28,50 +28,62 @@ function monthKey(d){if(!d)return null;const dt=d instanceof Date?d:new Date(d);
 // Extract dosage from product name: "LOMAC 20MG B/15" -> "20MG"
 function extractDosage(name){
   if(!name)return null;
-  // Normalize European thousands-separator dots: 200.000UI → 200000UI, 1.200.000UI → 1200000UI
-  // Only fires when dot is followed by exactly 3 digits before a known unit (not real decimals like 1.5MG)
-  const n=name.toUpperCase().replace(/(\d)\.(\d{3})(?=[\d.]*\s*(?:MG|G|ML|UI|MCG|µG|%))/g,'$1$2');
+  let n=name.toUpperCase();
+  
+  // Step 1: More aggressive normalization of European thousands separators
+  // 200.000UI → 200000UI, 1.200.000UI → 1200000UI, 200.000 UI → 200000UI
+  // Handle multiple dots: repeatedly remove dots that are before exactly 3 digits followed by more digits or a unit
+  while(true){
+    const before=n;
+    // Match: digit, dot, 3 digits, where next char is either another dot+digits or whitespace+unit or unit directly
+    n=n.replace(/(\d)\.(\d{3})(?=\.?\d|\s*(?:MG|G|ML|UI|MCG|µG|%))/gi,'$1$2');
+    if(n===before)break; // No more replacements
+  }
+  
+  // Step 2: Remove spaces around numbers before units for consistent matching
+  n=n.replace(/(\d)\s+(MG|G|ML|UI|MCG|µG|%)/gi,'$1$2');
+  
   // Match compound dosages first: 400MG/20MG, 100MG/12.5MG/ML, 1G/125MG, 1MG/5MG
-  let m=n.match(/(\d+(?:[.,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG)\s*\/\s*\d+(?:[.,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG)(?:\s*\/\s*\d*(?:[.,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG))?)/);
-  if(m)return m[1].replace(/\s+/g,'');
+  let m=n.match(/(\d+(?:[.,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG)\s*\/\s*\d+(?:[.,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG)(?:\s*\/\s*\d*(?:[.,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG))?)/i);
+  if(m)return m[1].replace(/\s+/g,'').toUpperCase();
   // Match slash dosages without units on first part: 10/160MG, 150/5MG, 300/10MG
-  m=n.match(/(\d+(?:[.,]\d+)?\s*\/\s*\d+(?:[.,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG))/);
-  if(m)return m[1].replace(/\s+/g,'');
+  m=n.match(/(\d+(?:[.,]\d+)?\s*\/\s*\d+(?:[.,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG))/i);
+  if(m)return m[1].replace(/\s+/g,'').toUpperCase();
   // Match percentage: 0.05%, 0.1%
-  m=n.match(/(\d+(?:[.,]\d+)?\s*%)/);
-  if(m)return m[1].replace(/\s+/g,'');
+  m=n.match(/(\d+(?:[.,]\d+)?\s*%)/i);
+  if(m)return m[1].replace(/\s+/g,'').toUpperCase();
   // Match dosage with /ML suffix: 5MG/ML, 20MG/ML
-  m=n.match(/(\d+(?:[.,]\d+)?\s*(?:MG|G|UI|MCG|µG)\s*\/\s*ML)/);
-  if(m)return m[1].replace(/\s+/g,'');
-  // Match single dosage: 20MG, 1G, 4000UI, 200000UI
-  m=n.match(/(\d[\d\s.,]*\d?\s*(?:MG|G|ML|UI|MCG|µG))/);
-  if(m)return m[1].replace(/\s+/g,'');
+  m=n.match(/(\d+(?:[.,]\d+)?\s*(?:MG|G|UI|MCG|µG)\s*\/\s*ML)/i);
+  if(m)return m[1].replace(/\s+/g,'').toUpperCase();
+  // Match single dosage: 20MG, 1G, 4000UI, 200000UI (now without dots)
+  m=n.match(/(\d+(?:[,]\d+)?\s*(?:MG|G|ML|UI|MCG|µG))/i);
+  if(m)return m[1].replace(/\s+/g,'').replace(',','.').toUpperCase();
   return null;
 }
 
 // Normalize dosage for comparison: "20MG" -> "20MG", "1G" -> "1000MG" etc
 function normalizeDosage(d){
   if(!d)return null;
-  d=d.toUpperCase().replace(/\s+/g,'').replace(',','.');
+  d=d.toUpperCase().replace(/\s+/g,'').replace(/,/g,'.');
   // Percentage: keep as-is
   if(d.includes('%'))return d;
   // Compound dosage with /: normalize each part
   if(d.includes('/')){
     return d.split('/').map(part=>{
       part=part.trim();
-      let m=part.match(/^([\d.]+)G$/);
+      let m=part.match(/^([\d.]+)G$/i);
       if(m)return (parseFloat(m[1])*1000)+'MG';
-      m=part.match(/^([\d.]+)(MG|ML|UI|MCG|µG)$/);
-      if(m)return parseFloat(m[1])+m[2];
+      m=part.match(/^([\d.]+)(MG|ML|UI|MCG|µG)$/i);
+      if(m)return parseFloat(m[1])+m[2].toUpperCase();
       return part;
     }).join('/');
   }
   // Convert G to MG for comparison
-  let m=d.match(/^([\d.]+)G$/);
+  let m=d.match(/^([\d.]+)G$/i);
   if(m)return (parseFloat(m[1])*1000)+'MG';
-  // Remove leading zeros
-  m=d.match(/^([\d.]+)(MG|ML|UI|MCG|µG)(.*)$/);
-  if(m)return parseFloat(m[1])+m[2]+m[3];
+  // Remove leading zeros and normalize number
+  m=d.match(/^([\d.]+)(MG|ML|UI|MCG|µG)(.*)$/i);
+  if(m)return parseFloat(m[1])+m[2].toUpperCase()+m[3];
   return d;
 }
 
