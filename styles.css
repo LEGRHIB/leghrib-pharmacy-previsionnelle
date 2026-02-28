@@ -133,3 +133,13 @@ tbody td{padding:7px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellip
 .dci-none{background:var(--red-bg);color:var(--red)}
 .dci-manual{background:var(--purple-bg);color:var(--purple)}
 .badge-orange{background:var(--orange);color:#fff;font-size:10px;padding:2px 6px;border-radius:10px;font-weight:600}
+/* V4.1: DCI/Category Autocomplete Dropdown */
+.dci-autocomplete{position:relative;display:inline-block;width:140px}
+.dci-input{background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:100%;outline:none;transition:all .15s}
+.dci-input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(59,130,246,.1)}
+.dci-dropdown{display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--bg3);border-top:none;border-radius:0 0 4px 4px;max-height:200px;overflow-y:auto;z-index:1000;box-shadow:0 4px 12px rgba(0,0,0,.3)}
+.dci-dropdown-item{padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--bg3);font-size:11px;color:var(--text);transition:background .1s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dci-dropdown-item:hover{background:var(--bg3);color:var(--accent)}
+.dci-dropdown-item:last-child{border-bottom:none}
+.dci-dropdown::-webkit-scrollbar{width:5px}.dci-dropdown::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
+.cat-badge{padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;background:var(--cyan-bg);color:var(--cyan)}

@@ -35,7 +35,7 @@ L'application **Leghrib Pharmacy V4** est un système complet de gestion prévis
 
 ## Comment Utiliser
 
-1. Ouvrir `index.html` dans un navigateur web
+1. Ouvrir `pharmaplanV4.html` dans un navigateur web
 2. Importer vos fichiers Excel (nomenclature, rotation, ventes mensuelles)
 3. Configurer les paramètres dans l'onglet Paramètres
 4. Consulter le tableau de bord pour une vue d'ensemble

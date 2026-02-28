@@ -7,8 +7,10 @@ const DB = {
     growth_global:0, growth_categories:{medicament:0,parapharm:0,dispositif:0,autre:0},
     targetMonths:{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1},
   },
-  manualDCI:{}, // V4: manual DCI corrections
-  importStatus: {rotation:false, monthly:0, nomenclature:false, nationalDCI:false},
+  manualDCI:{}, // V4: manual DCI corrections + category tags
+  manualCategories:[], // V4.1: user-defined custom categories
+  uniqueDCINames:[], // V4.1: sorted canonical DCI names for dropdown
+  importStatus: {rotation:false, monthly:0, nomenclature:false, chifaDCI:false},
   loaded: false
 };
 
@@ -156,10 +158,10 @@ function detectAndImport(raw, fileName, allSheets, sheetNames){
     if(vals.length>=4){
       const strs=vals.map(v=>String(v));
       // Check for known headers
-      if(strs.some(s=>s.includes('DENOMINATION COMMUNE'))){
+      // V4.1: Chifa AI database detection (replaces old national DCI)
+      if(strs.some(s=>s.toUpperCase().includes('DCI'))&&strs.some(s=>s.includes('signation'))&&strs.some(s=>s.toUpperCase().includes('TARIF')||s.toUpperCase().includes('CODE'))){
         headerIdx=i;
-        // This is the National DCI file — pass all sheets for retraits detection
-        return importNationalDCI(raw,headerIdx,fileName,allSheets,sheetNames);
+        return importChifaDCI(raw,headerIdx,fileName,allSheets,sheetNames);
       }
       if(strs.some(s=>s==='Désignation/Nom commercial'||s.includes('signation'))){
         headerIdx=i;
@@ -227,208 +229,128 @@ function importNomenclature(data){
   return 'nomenclature';
 }
 
-function importNationalDCI(raw,headerIdx,fileName,allSheets,sheetNames){
+// V4.1: Import Chifa AI DCI database (replaces old national DCI)
+function importChifaDCI(raw,headerIdx,fileName,allSheets,sheetNames){
   const headers=raw[headerIdx];
   const colIdx={};
   headers.forEach((h,i)=>{
     const s=String(h||'').toUpperCase();
-    if(s.includes('DENOMINATION COMMUNE'))colIdx.dci=i;
-    else if(s.includes('NOM DE MARQUE'))colIdx.brand=i;
-    else if(s==='FORME')colIdx.form=i;
-    else if(s==='DOSAGE')colIdx.dosage=i;
-    else if(s==='CODE')colIdx.code=i;
-    else if(s==='TYPE')colIdx.type=i;
-    else if(s.includes('LABORATOIRE')&&!s.includes('PAYS'))colIdx.labo=i;
+    if(s.includes('DCI')&&!s.includes('TARIF'))colIdx.dci=i;
+    else if(s.includes('SIGNATION'))colIdx.designation=i;
+    else if(s==='CODE'||s.includes('CODE'))colIdx.code=i;
+    else if(s.includes('TARIF'))colIdx.tarif=i;
   });
   const items=[];
+  const dciCodeCounts={}; // dciCode → {name→count} for canonical name selection
   for(let i=headerIdx+1;i<raw.length;i++){
-    const row=raw[i];
-    if(!row||!row[colIdx.brand])continue;
-    const n=String(row[colIdx.dci]||'').trim();
-    if(!n)continue;
+    const row=raw[i];if(!row)continue;
+    const designation=String(row[colIdx.designation]||'').trim().toUpperCase();
+    const dciField=String(row[colIdx.dci]||'').trim().toUpperCase();
+    if(!designation||!dciField)continue;
+    // Parse DCI field: "01A003 CETIRIZINE" → code + name
+    const spIdx=dciField.indexOf(' ');
+    const dciCode=spIdx>0?dciField.substring(0,spIdx).trim():'';
+    let dciName=spIdx>0?dciField.substring(spIdx+1).trim():dciField;
+    // Clean up DCI name: remove salt suffixes for canonical grouping
+    const dciNameClean=dciName.replace(/[\s,]*(SOUS FORME|S\/F|CHLORHYDRATE|DICHLORHYDRATE|DIHYDROCHLORHYDE|MALEATE|SULFATE|FUMARATE|TARTRATE|SUCCINATE|BROMHYDRATE|PHOSPHATE|ACETATE|CITRATE|BESYLATE|MESYLATE|LYSINATE|SODIQUE|POTASSIQUE|CALCIQUE|DE BASE|BASE|EXPRIME EN).*$/i,'').replace(/[,;.]+$/,'').trim();
+    const brand=extractBrand(designation);
+    const dosage=extractDosage(designation);
+    const code=colIdx.code!=null?String(row[colIdx.code]||'').trim():'';
+    const tarif=colIdx.tarif!=null?Number(row[colIdx.tarif])||0:0;
+    // Detect form from designation
+    let form='';
+    const fMatch=designation.match(/\b(COMP|GELULE|GLES|GEL|PDRE|AMP|INJ|SUPPO|SPRAY|SIROP|SIR|CREME|POMMADE|COLLYRE|SOL|SACHET|CAPS|PATCH|SUSP|OVULE|GTTES|GOUTTES)\b\.?/i);
+    if(fMatch)form=fMatch[1].toUpperCase();
     items.push({
-      dci:n.toUpperCase(),brand:String(row[colIdx.brand]||'').trim().toUpperCase(),
-      dosage:String(row[colIdx.dosage]||'').trim().toUpperCase(),
-      form:String(row[colIdx.form]||'').trim().toUpperCase(),
-      code:String(row[colIdx.code]||'').trim(),
-      type:String(row[colIdx.type]||'').trim().toUpperCase(),
-      labo:String(row[colIdx.labo]||'').trim(),
-      withdrawn:false
+      dci:dciName,dciClean:dciNameClean,dciCode,brand:brand||designation.split(/\s+/)[0],
+      dosage:dosage||'',form,code,tarif,designation,withdrawn:false
     });
-  }
-
-  // V3: Detect and import NON RENOUVELÉS (non-renewed) medicines from other sheets — add to matching pool
-  if(allSheets&&sheetNames){
-    for(const sn of sheetNames){
-      const snUpper=sn.toUpperCase().replace(/\s+/g,' ').trim();
-      if(snUpper.includes('NON')&&snUpper.includes('RENOUVE')||snUpper.includes('NON RENOUVE')){
-        const sheetData=allSheets[sn];
-        if(!sheetData||sheetData.length<2)continue;
-        // Find header row
-        let nrHeaderIdx=0;
-        for(let i=0;i<Math.min(20,sheetData.length);i++){
-          const row=sheetData[i];if(!row)continue;
-          const vals=row.filter(v=>v!=null&&String(v).trim()!=='');
-          const strs=vals.map(v=>String(v).toUpperCase());
-          if(strs.some(s=>s.includes('DENOMINATION COMMUNE'))){nrHeaderIdx=i;break;}
-          if(vals.length>=4){nrHeaderIdx=i;break;}
-        }
-        const nrHeaders=sheetData[nrHeaderIdx];
-        const nrCols={};
-        if(nrHeaders){
-          nrHeaders.forEach((h,i)=>{
-            const s=String(h||'').toUpperCase();
-            if(s.includes('DENOMINATION COMMUNE'))nrCols.dci=i;
-            else if(s.includes('NOM DE MARQUE'))nrCols.brand=i;
-            else if(s==='DOSAGE'||s.includes('DOSAGE'))nrCols.dosage=i;
-            else if(s==='FORME'||s.includes('FORME'))nrCols.form=i;
-            else if(s==='CODE'||s.includes('CODE'))nrCols.code=i;
-            else if(s==='TYPE'||s.includes('TYPE'))nrCols.type=i;
-            else if(s.includes('LABORATOIRE')&&!s.includes('PAYS'))nrCols.labo=i;
-          });
-        }
-        let nrCount=0;
-        for(let i=nrHeaderIdx+1;i<sheetData.length;i++){
-          const row=sheetData[i];if(!row)continue;
-          const brand=nrCols.brand!=null?String(row[nrCols.brand]||'').trim().toUpperCase():null;
-          const dci=nrCols.dci!=null?String(row[nrCols.dci]||'').trim().toUpperCase():null;
-          if(!brand||!dci)continue;
-          items.push({
-            dci,brand,
-            dosage:nrCols.dosage!=null?String(row[nrCols.dosage]||'').trim().toUpperCase():'',
-            form:nrCols.form!=null?String(row[nrCols.form]||'').trim().toUpperCase():'',
-            code:nrCols.code!=null?String(row[nrCols.code]||'').trim():'',
-            type:nrCols.type!=null?String(row[nrCols.type]||'').trim().toUpperCase():'',
-            labo:nrCols.labo!=null?String(row[nrCols.labo]||'').trim():'',
-            withdrawn:false,nonRenewed:true
-          });
-          nrCount++;
-        }
-        console.log(`Non Renouvelés sheet "${sn}": ${nrCount} additional medicines added to matching pool`);
-      }
+    // Track DCI code → clean name frequencies
+    if(dciCode){
+      if(!dciCodeCounts[dciCode])dciCodeCounts[dciCode]={};
+      dciCodeCounts[dciCode][dciNameClean]=(dciCodeCounts[dciCode][dciNameClean]||0)+1;
     }
   }
+  // Build canonical DCI name per code (most frequent clean name)
+  const canonicalDCI={}; // dciCode → canonical clean name
+  Object.entries(dciCodeCounts).forEach(([code,names])=>{
+    let best='',bestCount=0;
+    Object.entries(names).forEach(([name,count])=>{if(count>bestCount){bestCount=count;best=name;}});
+    canonicalDCI[code]=best;
+  });
+  // Apply canonical names to items
+  items.forEach(item=>{
+    if(item.dciCode&&canonicalDCI[item.dciCode])item.dci=canonicalDCI[item.dciCode];
+  });
+  // Build unique DCI names list for dropdown (~1676 entries)
+  DB.uniqueDCINames=Object.values(canonicalDCI).filter(n=>n).sort();
 
-  // V3: Detect and import RETRAITS (withdrawn medicines) from other sheets
-  DB.retraits=[];
-  DB._withdrawnBrands=new Set();
+  // Detect retraits from other sheets (same logic as before)
+  DB.retraits=[];DB._withdrawnBrands=new Set();
   if(allSheets&&sheetNames){
     for(const sn of sheetNames){
       const snUpper=sn.toUpperCase();
-      // Look for sheet named "retrait", "retraits", "retirés", or containing "retrait"
       if(snUpper.includes('RETRAIT')||snUpper.includes('RETIRE')||snUpper.includes('RETIRÉ')){
-        const sheetData=allSheets[sn];
-        if(!sheetData||sheetData.length<2)continue;
-        // Find header row in this sheet
+        const sheetData=allSheets[sn];if(!sheetData||sheetData.length<2)continue;
         let retHeaderIdx=0;
         for(let i=0;i<Math.min(10,sheetData.length);i++){
-          const row=sheetData[i];
-          if(!row)continue;
+          const row=sheetData[i];if(!row)continue;
           const vals=row.filter(v=>v!=null&&String(v).trim()!=='');
           if(vals.length>=2){retHeaderIdx=i;break;}
         }
-        const retHeaders=sheetData[retHeaderIdx];
-        // Map columns — look for brand/DCI/dosage columns (flexible)
-        const retCols={};
-        if(retHeaders){
-          retHeaders.forEach((h,i)=>{
-            const s=String(h||'').toUpperCase();
-            if(s.includes('DENOMINATION COMMUNE')||s.includes('DCI'))retCols.dci=i;
-            else if(s.includes('NOM DE MARQUE')||s.includes('MARQUE')||s.includes('DESIGNATION')||s.includes('NOM'))retCols.brand=i;
-            else if(s==='DOSAGE'||s.includes('DOSAGE'))retCols.dosage=i;
-            else if(s==='FORME'||s.includes('FORME'))retCols.form=i;
-            else if(s==='CODE'||s.includes('CODE'))retCols.code=i;
-            else if(s.includes('LABORATOIRE'))retCols.labo=i;
-            else if(s.includes('DATE')||s.includes('RETRAIT'))retCols.date=i;
-            else if(s.includes('MOTIF')||s.includes('RAISON'))retCols.reason=i;
-          });
-        }
-        // Parse withdrawn items
+        const retHeaders=sheetData[retHeaderIdx];const retCols={};
+        if(retHeaders){retHeaders.forEach((h,i)=>{
+          const s=String(h||'').toUpperCase();
+          if(s.includes('DCI')||s.includes('DENOMINATION'))retCols.dci=i;
+          else if(s.includes('MARQUE')||s.includes('DESIGNATION')||s.includes('NOM'))retCols.brand=i;
+          else if(s.includes('DOSAGE'))retCols.dosage=i;
+          else if(s.includes('CODE'))retCols.code=i;
+        });}
         for(let i=retHeaderIdx+1;i<sheetData.length;i++){
-          const row=sheetData[i];
-          if(!row)continue;
-          // Try to get brand name — use brand column if available, otherwise first non-null column
+          const row=sheetData[i];if(!row)continue;
           let brand=retCols.brand!=null?String(row[retCols.brand]||'').trim().toUpperCase():null;
-          const dci=retCols.dci!=null?String(row[retCols.dci]||'').trim().toUpperCase():null;
           const dosage=retCols.dosage!=null?String(row[retCols.dosage]||'').trim().toUpperCase():null;
-          const code=retCols.code!=null?String(row[retCols.code]||'').trim():null;
-          const labo=retCols.labo!=null?String(row[retCols.labo]||'').trim():null;
-          const reason=retCols.reason!=null?String(row[retCols.reason]||'').trim():null;
-          // If no brand column found, try first non-empty cell
-          if(!brand){
-            for(let j=0;j<row.length;j++){
-              if(row[j]!=null&&String(row[j]).trim()){brand=String(row[j]).trim().toUpperCase();break;}
-            }
-          }
+          if(!brand){for(let j=0;j<row.length;j++){if(row[j]!=null&&String(row[j]).trim()){brand=String(row[j]).trim().toUpperCase();break;}}}
           if(!brand)continue;
-          DB.retraits.push({brand,dci:dci||null,dosage:dosage||null,code:code||null,labo:labo||null,reason:reason||null});
-          // Build lookup: brand name (first word for matching) + full brand
-          DB._withdrawnBrands.add(brand);
-          const firstWord=brand.split(/\s+/)[0];
-          DB._withdrawnBrands.add(firstWord);
-          // If dosage available, also add "brand|dosage" key for precise matching
-          if(dosage){
-            DB._withdrawnBrands.add(brand+'|'+normalizeDosage(dosage));
-          }
+          DB.retraits.push({brand,dosage:dosage||null});
+          DB._withdrawnBrands.add(brand);DB._withdrawnBrands.add(brand.split(/\s+/)[0]);
+          if(dosage)DB._withdrawnBrands.add(brand+'|'+normalizeDosage(dosage));
         }
-        console.log(`Retraits sheet "${sn}": ${DB.retraits.length} withdrawn medicines loaded`);
       }
     }
   }
-
-  // Mark withdrawn items in the national DCI list
+  // Mark withdrawn in items
   items.forEach(item=>{
     const preciseKey=item.brand+'|'+normalizeDosage(item.dosage);
-    if(DB._withdrawnBrands.has(preciseKey)||DB._withdrawnBrands.has(item.brand)){
-      item.withdrawn=true;
-    }
+    if(DB._withdrawnBrands.has(preciseKey)||DB._withdrawnBrands.has(item.brand))item.withdrawn=true;
   });
-  // Filter OUT withdrawn from active national DCI list
   DB.nationalDCI=items.filter(item=>!item.withdrawn);
-  DB.nationalDCI_all=items; // Keep full list for reference
-  DB.importStatus.nationalDCI=true;
+  DB.nationalDCI_all=items;
+  DB.importStatus.chifaDCI=true;
   DB.importStatus.retraits=DB.retraits.length;
-  // V3: Build strict matching indices (only from non-withdrawn)
-  buildNationalIndex();
-  return 'nationalDCI';
+  buildDCIIndex();
+  return 'chifaDCI';
 }
 
-// ==================== V3: NATIONAL DCI INDEX BUILDER ====================
-function buildNationalIndex(){
-  // Build multiple lookup indices from national DCI database
-  // _brandIndex: normalized brand name → array of {dci,dosage,form,code,brand,type,labo}
-  // _byCode: code → {dci,dosage,form,brands:[]}
-  // _dciDosageIndex: "DCI|normDosage" → array of national entries (all generics for this DCI+dose)
-  DB._brandIndex={};
-  DB._byCode={};
-  DB._dciDosageIndex={};
-
+// ==================== V4.1: DCI INDEX BUILDER (Chifa) ====================
+function buildDCIIndex(){
+  DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};
   DB.nationalDCI.forEach(item=>{
     if(!item.brand)return;
-    // Index by brand name (multiple keys: full brand, first 2 words, first word)
     const brandNorm=item.brand.trim().toUpperCase().replace(/\s+/g,' ');
     const words=brandNorm.split(' ');
     const keys=new Set();
-    keys.add(brandNorm); // full brand
-    if(words.length>=2)keys.add(words.slice(0,2).join(' ')); // first 2 words
-    keys.add(words[0]); // first word
-
+    keys.add(brandNorm);
+    if(words.length>=2)keys.add(words.slice(0,2).join(' '));
+    keys.add(words[0]);
     const entry={dci:item.dci,dosage:item.dosage,form:item.form,code:item.code,
-      brand:item.brand,type:item.type,labo:item.labo,
+      brand:item.brand,dciCode:item.dciCode||'',tarif:item.tarif||0,
       normDosage:normalizeDosage(item.dosage)};
-
-    keys.forEach(k=>{
-      if(!DB._brandIndex[k])DB._brandIndex[k]=[];
-      DB._brandIndex[k].push(entry);
-    });
-
-    // Index by code
+    keys.forEach(k=>{if(!DB._brandIndex[k])DB._brandIndex[k]=[];DB._brandIndex[k].push(entry);});
     if(item.code){
       if(!DB._byCode[item.code])DB._byCode[item.code]={dci:item.dci,dosage:item.dosage,form:item.form,brands:[]};
-      DB._byCode[item.code].brands.push({brand:item.brand,type:item.type,labo:item.labo});
+      DB._byCode[item.code].brands.push({brand:item.brand,dciCode:item.dciCode});
     }
-
-    // Index by DCI+dosage (all generics for this molecule+strength)
     const dciDosKey=(item.dci+'|'+normalizeDosage(item.dosage)).toUpperCase();
     if(!DB._dciDosageIndex[dciDosKey])DB._dciDosageIndex[dciDosKey]=[];
     DB._dciDosageIndex[dciDosKey].push(entry);
@@ -594,29 +516,28 @@ function computeAll(){
     });
   });
 
-  // Step 4: V3 — Match products to national DCI (strict brand+dosage)
-  if(DB.importStatus.nationalDCI){
+  // Step 4: V4.1 — Match products to Chifa DCI database (strict brand+dosage)
+  if(DB.importStatus.chifaDCI){
     Object.values(products).forEach(p=>{
       const match=matchProductToDCI(p.name);
       if(match){
-        p.dciCode=match.code;
+        p.dciCode=match.dciCode||match.code;
         p.matchedDosage=match.normDosage||normalizeDosage(match.dosage);
         p.matchedBrand=match.brand;
         p.matchedForm=match.form;
-        p.dci=match.dci; // V4: Always use national DCI (more reliable than rotation)
-        if(match.labo)p.labo=match.labo; // V4: Also get labo from national DB
+        p.dci=match.dci;
         p.category='medicament';
       }
     });
   }
 
-  // Step 4a-V4: Apply manual DCI corrections (overrides auto-matching)
+  // Step 4a-V4.1: Apply manual DCI corrections + category tags
   if(DB.manualDCI){
     Object.entries(DB.manualDCI).forEach(([name,corr])=>{
       const p=products[name];if(!p)return;
       if(corr.dci){p.dci=corr.dci;p.category='medicament';}
       if(corr.dosage)p.matchedDosage=normalizeDosage(corr.dosage);
-      if(corr.labo)p.labo=corr.labo;
+      if(corr.category){p.manualCategory=corr.category;p.category='parapharm';}
       p.manualDCI=true;
     });
   }
@@ -657,7 +578,7 @@ function computeAll(){
   }
 
   // Step 4b: V3 — Detect & merge duplicate products (same brand+dosage = same medicine)
-  if(DB.importStatus.nationalDCI){
+  if(DB.importStatus.chifaDCI){
     const dupGroups={};// key: "matchedBrand|normDosage" → [product names]
     Object.values(products).forEach(p=>{
       if(!p.matchedBrand||!p.matchedDosage)return;
@@ -807,8 +728,24 @@ function computeAll(){
 
   // Step 6: V3 — DCI group coverage (STRICT by DCI name + normalized dosage)
   // Groups are ONLY products with same DCI molecule AND same dosage
+  // V4.1: Category grouping for non-DCI products (cosmétiques/articles)
+  DB._categoryGroups={};
+  Object.values(products).forEach(p=>{
+    if(p.dci||!p.manualCategory)return;
+    const cat=p.manualCategory;
+    if(!DB._categoryGroups[cat])DB._categoryGroups[cat]={category:cat,products:[],totalStock:0,totalDaily:0};
+    DB._categoryGroups[cat].products.push(p);
+    DB._categoryGroups[cat].totalStock+=p.effectiveStock;
+    DB._categoryGroups[cat].totalDaily+=p.dailyConsumption;
+  });
+  Object.values(DB._categoryGroups).forEach(group=>{
+    const gd=group.totalDaily>0?group.totalStock/group.totalDaily:9999;
+    group.groupDays=gd;
+    group.products.forEach(p=>{p.categoryGroupDays=gd;p.categoryGroupCount=group.products.length;p.categoryGroupStock=group.totalStock;});
+  });
+
   DB._dciGroups={};
-  if(DB.importStatus.nationalDCI){
+  if(DB.importStatus.chifaDCI){
     Object.values(products).forEach(p=>{
       if(!p.dci||!p.matchedDosage)return;
       const gKey=(p.dci+'|'+p.matchedDosage).toUpperCase();
@@ -908,28 +845,28 @@ function showPage(page){
 // ==================== IMPORT PAGE ====================
 function renderImport(el){
   const s=DB.importStatus;
-  const matched=DB.importStatus.nationalDCI?Object.values(DB.products).filter(p=>p.dciCode).length:0;
+  const matched=DB.importStatus.chifaDCI?Object.values(DB.products).filter(p=>p.dciCode).length:0;
   el.innerHTML=`
     <h2 class="page-title">Importation des Données</h2>
     <p class="page-subtitle">Glissez vos fichiers ici — le système détecte automatiquement le type</p>
     <div class="import-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
       <div class="import-icon">📁</div>
       <h3>Glissez vos fichiers ici</h3>
-      <p>Nomenclature ERP, fichiers mensuels, rotation annuelle, base nationale DCI<br>Sélection multiple acceptée — tous formats .xlsx</p>
+      <p>Nomenclature ERP, fichiers mensuels, rotation annuelle, Médicaments Chifa AI<br>Sélection multiple acceptée — tous formats .xlsx</p>
       <input type="file" class="hidden-input" id="fileInput" accept=".xlsx,.xls" multiple onchange="handleAllFiles(this.files)">
     </div>
     <div class="import-status-grid">
       <div class="import-status"><span class="dot ${s.nomenclature?'dot-green':'dot-gray'}"></span>${s.nomenclature?`✓ Nomenclature ERP — ${DB.nomenclature.length.toLocaleString()} lots chargés`:'◯ Nomenclature ERP (stock quotidien)'}</div>
       <div class="import-status"><span class="dot ${s.monthly>0?'dot-green':'dot-gray'}"></span>${s.monthly>0?`✓ Fichiers mensuels — ${s.monthly} mois chargés`:'◯ Fichiers mensuels (historique ventes)'}</div>
       <div class="import-status"><span class="dot ${s.rotation?'dot-green':'dot-gray'}"></span>${s.rotation?`✓ Rotation annuelle — ${DB.rotation.length} produits`:'◯ Rotation annuelle — optionnel (enrichissement DCI/labo)'}</div>
-      <div class="import-status"><span class="dot ${s.nationalDCI?'dot-green':'dot-gray'}"></span>${s.nationalDCI?`✓ Base nationale DCI — ${DB.nationalDCI.length} médicaments, ${matched} matchés${s.retraits>0?' | ⛔ '+s.retraits+' retraits chargés':''}`:'◯ Base nationale DCI (génériques + retraits)'}</div>
+      <div class="import-status"><span class="dot ${s.chifaDCI?'dot-green':'dot-gray'}"></span>${s.chifaDCI?`✓ Médicaments Chifa AI — ${DB.nationalDCI.length} médicaments, ${matched} matchés${s.retraits>0?' | ⛔ '+s.retraits+' retraits chargés':''}`:'◯ Médicaments Chifa AI (base DCI nationale)'}</div>
     </div>
     <div style="margin-top:24px;text-align:center">
       <button class="btn btn-primary" onclick="runCompute()" style="padding:12px 32px;font-size:15px" ${!s.nomenclature&&!s.rotation&&s.monthly===0?'disabled style="opacity:.5;padding:12px 32px;font-size:15px"':''}>🔄 Calculer les Prévisions</button>
       <button class="btn btn-secondary" onclick="clearAll()" style="padding:12px 24px;font-size:15px;margin-left:12px">🗑️ Réinitialiser</button>
     </div>
     <div id="importProgress" style="margin-top:16px;text-align:center;display:none"><div class="spinner"></div> <span id="progressText">Traitement...</span></div>
-    ${DB.loaded?`<div style="margin-top:16px;padding:16px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);border-radius:8px;text-align:center;font-size:14px;color:var(--green)">✓ ${Object.keys(DB.products).length} produits analysés${DB.importStatus.nationalDCI?` — ${matched} matchés à la base nationale DCI`:''}${DB._mergedProducts&&Object.keys(DB._mergedProducts).length>0?' — '+Object.keys(DB._mergedProducts).length+' doublons fusionnés':''}</div>`:''}`;
+    ${DB.loaded?`<div style="margin-top:16px;padding:16px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);border-radius:8px;text-align:center;font-size:14px;color:var(--green)">✓ ${Object.keys(DB.products).length} produits analysés${DB.importStatus.chifaDCI?` — ${matched} matchés à la base Chifa AI`:''}${DB._mergedProducts&&Object.keys(DB._mergedProducts).length>0?' — '+Object.keys(DB._mergedProducts).length+' doublons fusionnés':''}</div>`:''}`;
   const zone=document.getElementById('dropZone');
   zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('dragover')});
   zone.addEventListener('dragleave',()=>zone.classList.remove('dragover'));
@@ -940,7 +877,7 @@ async function handleAllFiles(fileList){
   const files=Array.from(fileList);if(!files.length)return;
   const prog=document.getElementById('importProgress');const txt=document.getElementById('progressText');
   if(prog)prog.style.display='block';
-  const results={rotation:0,monthly:0,nomenclature:0,nationalDCI:0,unknown:0};
+  const results={rotation:0,monthly:0,nomenclature:0,chifaDCI:0,unknown:0};
   for(let i=0;i<files.length;i++){
     if(txt)txt.textContent=`Fichier ${i+1}/${files.length}: ${files[i].name}`;
     try{
@@ -957,7 +894,7 @@ function runCompute(){
   const prog=document.getElementById('importProgress');if(prog)prog.style.display='block';
   setTimeout(()=>{computeAll();if(prog)prog.style.display='none';updateBadges();renderImport(document.getElementById('mainContent'))},100);
 }
-function clearAll(){if(!confirm('Supprimer toutes les données ?'))return;DB.rotation=[];DB.monthly={};DB.nomenclature=[];DB.nationalDCI=[];DB.nationalDCI_all=[];DB.retraits=[];DB._withdrawnBrands=new Set();DB.products={};DB.suppliers={};DB.dciGroups={};DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};DB._dciGroups={};DB._mergedProducts={};DB.importStatus={rotation:false,monthly:0,nomenclature:false,nationalDCI:false,retraits:0};DB.loaded=false;localStorage.clear();updateBadges();renderImport(document.getElementById('mainContent'));}
+function clearAll(){if(!confirm('Supprimer toutes les données ?'))return;DB.rotation=[];DB.monthly={};DB.nomenclature=[];DB.nationalDCI=[];DB.nationalDCI_all=[];DB.retraits=[];DB._withdrawnBrands=new Set();DB.products={};DB.suppliers={};DB.dciGroups={};DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};DB._dciGroups={};DB._categoryGroups={};DB._mergedProducts={};DB.uniqueDCINames=[];DB.importStatus={rotation:false,monthly:0,nomenclature:false,chifaDCI:false,retraits:0};DB.loaded=false;localStorage.clear();updateBadges();renderImport(document.getElementById('mainContent'));}
 function updateBadges(){if(!DB.loaded)return;const ps=Object.values(DB.products);const a=ps.filter(p=>['rupture','5j'].includes(p.alertLevel)).length;const e=ps.filter(p=>p.expiredQty>0||p.nearExpiryQty>0).length;const ab=document.getElementById('alertBadge'),eb=document.getElementById('expiryBadge'),db=document.getElementById('dciMatchBadge');if(ab){ab.textContent=a;ab.style.display=a>0?'inline':'none'}if(eb){eb.textContent=e;eb.style.display=e>0?'inline':'none'}
 // V4: DCI unmatched badge
 if(db){const unmatched=ps.filter(p=>p.alertLevel!=='dead'&&!p.dci&&!p.withdrawn).length;db.textContent=unmatched;db.style.display=unmatched>0?'inline':'none'}}
@@ -974,7 +911,7 @@ function renderDashboard(el){
 
   el.innerHTML=`
     <h2 class="page-title">Tableau de Bord</h2>
-    <p class="page-subtitle">${fmt(active.length)} produits actifs — Stock depuis nomenclature ERP${DB.importStatus.nationalDCI?` — ${dciCovered} produits couverts par génériques`:''}</p>
+    <p class="page-subtitle">${fmt(active.length)} produits actifs — Stock depuis nomenclature ERP${DB.importStatus.chifaDCI?` — ${dciCovered} produits couverts par génériques`:''}</p>
     <div class="cards">
       <div class="card"><div class="card-label">Produits Actifs</div><div class="card-value">${fmt(active.length)}</div><div class="card-sub">sur ${fmt(ps.length)} total</div></div>
       <div class="card red"><div class="card-label">Ruptures</div><div class="card-value">${fmt(rup.length)}</div></div>
@@ -1360,32 +1297,53 @@ function renderExpiry(el){
 
 // ==================== V4: DCI MATCHING PAGE ====================
 let dciFilter='all',dciSearch='';
+// V4.1: Predefined cosmétique/article categories
+const CATEGORIES_PREDEF=['Crème','Shampooing','Écran Solaire','Dentifrice','Lait Corporel','Déodorant','Maquillage','Complément Alimentaire','Hygiène Bébé','Accessoire','Autre'];
+
+// V4.1: Generic dropdown functions
+function filterDropdown(inputId,dropdownId,list,value){
+  const dd=document.getElementById(dropdownId);if(!dd)return;
+  const q=(value||'').trim().toUpperCase();
+  let matches=q.length<1?list.slice(0,15):list.filter(n=>n.toUpperCase().includes(q)).slice(0,15);
+  if(matches.length===0){dd.style.display='none';return;}
+  dd.innerHTML=matches.map(n=>`<div class="dci-dropdown-item" onmousedown="selectDropdownItem('${inputId}','${dropdownId}','${escAttr(n)}')">${n}</div>`).join('');
+  dd.style.display='block';
+}
+function selectDropdownItem(inputId,dropdownId,val){
+  const inp=document.getElementById(inputId);if(inp){inp.value=val;inp.dispatchEvent(new Event('change'));}
+  closeDropdown(dropdownId);
+}
+function closeDropdown(dropdownId){const dd=document.getElementById(dropdownId);if(dd)dd.style.display='none';}
+
 function renderDCIMatch(el){
   if(!DB.loaded){el.innerHTML='<p style="padding:40px;text-align:center;color:var(--text3)">Importez les données d\'abord.</p>';return}
   const ps=Object.values(DB.products).filter(p=>p.alertLevel!=='dead'&&!p.withdrawn);
   const matched=ps.filter(p=>p.dci&&!p.manualDCI);
-  const approx=ps.filter(p=>p.dci&&!p.manualDCI&&(DB.products[p.name]&&DB.products[p.name].matchedDosage===undefined));
-  const unmatched=ps.filter(p=>!p.dci);
+  const unmatched=ps.filter(p=>!p.dci&&!p.manualCategory);
   const corrected=ps.filter(p=>p.manualDCI);
+  const articles=ps.filter(p=>!p.dci&&p.category!=='medicament');
+  const categorized=ps.filter(p=>p.manualCategory);
   el.innerHTML=`
-    <h2 class="page-title">Matching DCI</h2>
-    <p class="page-subtitle">Vérifiez et corrigez les attributions DCI automatiques</p>
+    <h2 class="page-title">Matching DCI & Catégories</h2>
+    <p class="page-subtitle">Attribuez les DCI (médicaments) et catégories (articles/cosmétiques)</p>
     <div class="cards">
       <div class="card green"><div class="card-label">Matchés Auto</div><div class="card-value">${matched.length}</div></div>
       <div class="card red"><div class="card-label">Non Matchés</div><div class="card-value">${unmatched.length}</div></div>
-      <div class="card purple"><div class="card-label">Corrigés Manuellement</div><div class="card-value">${corrected.length}</div></div>
+      <div class="card purple"><div class="card-label">Corrigés</div><div class="card-value">${corrected.length}</div></div>
+      <div class="card cyan"><div class="card-label">Articles Catégorisés</div><div class="card-value">${categorized.length}</div></div>
     </div>
     <div class="tabs">
       <div class="tab ${dciFilter==='all'?'active':''}" onclick="dciFilter='all';renderDCIMatch(document.getElementById('mainContent'))">Tous (${ps.length})</div>
       <div class="tab ${dciFilter==='unmatched'?'active':''}" onclick="dciFilter='unmatched';renderDCIMatch(document.getElementById('mainContent'))">Non matchés ✗ (${unmatched.length})</div>
       <div class="tab ${dciFilter==='corrected'?'active':''}" onclick="dciFilter='corrected';renderDCIMatch(document.getElementById('mainContent'))">Corrigés ✎ (${corrected.length})</div>
+      <div class="tab ${dciFilter==='articles'?'active':''}" onclick="dciFilter='articles';renderDCIMatch(document.getElementById('mainContent'))">Articles ✦ (${articles.length})</div>
     </div>
     <div class="table-wrap">
       <div class="table-toolbar">
-        <input id="dciSearchInput" placeholder="🔍 Rechercher produit, DCI..." value="${dciSearch}" oninput="dciSearch=this.value;updateDCITable()">
+        <input id="dciSearchInput" placeholder="🔍 Rechercher produit, DCI, catégorie..." value="${dciSearch}" oninput="dciSearch=this.value;updateDCITable()">
       </div>
       <div class="table-scroll" style="max-height:calc(100vh - 420px)"><table>
-        <thead><tr><th>Produit</th><th>DCI Auto</th><th>Dosage Auto</th><th>Labo Auto</th><th>Confiance</th><th>DCI Manuel</th><th>Dosage Manuel</th><th>Labo Manuel</th><th>Action</th></tr></thead>
+        <thead><tr><th>Produit</th><th>DCI Auto</th><th>Dosage</th><th>Confiance</th><th>Correction DCI / Catégorie</th><th>Dosage (opt.)</th><th>Action</th></tr></thead>
         <tbody id="dciTableBody"></tbody>
       </table></div>
     </div>`;
@@ -1393,43 +1351,70 @@ function renderDCIMatch(el){
 }
 function updateDCITable(){
   let ps=Object.values(DB.products).filter(p=>p.alertLevel!=='dead'&&!p.withdrawn);
-  if(dciFilter==='unmatched')ps=ps.filter(p=>!p.dci);
+  if(dciFilter==='unmatched')ps=ps.filter(p=>!p.dci&&!p.manualCategory);
   else if(dciFilter==='corrected')ps=ps.filter(p=>p.manualDCI);
-  if(dciSearch){const q=dciSearch.toUpperCase();ps=ps.filter(p=>p.name.includes(q)||(p.dci&&p.dci.includes(q)))}
-  ps.sort((a,b)=>(!a.dci?-1:!b.dci?1:0)||(b.riskScore-a.riskScore));
+  else if(dciFilter==='articles')ps=ps.filter(p=>!p.dci&&p.category!=='medicament');
+  if(dciSearch){const q=dciSearch.toUpperCase();ps=ps.filter(p=>p.name.includes(q)||(p.dci&&p.dci.includes(q))||(p.manualCategory&&p.manualCategory.toUpperCase().includes(q)))}
+  ps.sort((a,b)=>(!a.dci&&!a.manualCategory?-1:!b.dci&&!b.manualCategory?1:0)||(b.riskScore-a.riskScore));
   const tbody=document.getElementById('dciTableBody');if(!tbody)return;
+  const allCats=[...new Set([...CATEGORIES_PREDEF,...(DB.manualCategories||[])])].sort();
   tbody.innerHTML=ps.slice(0,200).map(p=>{
+    const key=btoa(encodeURIComponent(p.name)).replace(/=/g,'');
     const corr=DB.manualDCI[p.name]||{};
-    const conf=p.manualDCI?'<span class="dci-confidence dci-manual">✎ Manuel</span>':p.dci?'<span class="dci-confidence dci-exact">✓ Auto</span>':'<span class="dci-confidence dci-none">✗ Aucun</span>';
+    const isArticle=!p.dci&&p.category!=='medicament'&&!corr.dci;
+    const conf=p.manualCategory?'<span class="dci-confidence dci-manual">✦ Catégorie</span>':p.manualDCI?'<span class="dci-confidence dci-manual">✎ Manuel</span>':p.dci?'<span class="dci-confidence dci-exact">✓ Auto</span>':'<span class="dci-confidence dci-none">✗ Aucun</span>';
+    // Dropdown: DCI for medicines, Category for articles
+    const ddId='dd_'+key;
+    const inpId='dci_'+key;
+    let ddField;
+    if(isArticle||corr.category){
+      ddField=`<div class="dci-autocomplete"><input id="${inpId}" value="${corr.category||''}" placeholder="Catégorie..." class="dci-input" autocomplete="off"
+        oninput="filterDropdown('${inpId}','${ddId}',${JSON.stringify(allCats).replace(/"/g,'&quot;')},this.value)"
+        onfocus="filterDropdown('${inpId}','${ddId}',${JSON.stringify(allCats).replace(/"/g,'&quot;')},this.value)"
+        onblur="setTimeout(()=>closeDropdown('${ddId}'),200)">
+        <div id="${ddId}" class="dci-dropdown"></div></div>`;
+    } else {
+      const dciList='DB.uniqueDCINames';
+      ddField=`<div class="dci-autocomplete"><input id="${inpId}" value="${corr.dci||''}" placeholder="${p.dci||'DCI...'}" class="dci-input" autocomplete="off"
+        oninput="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
+        onfocus="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
+        onblur="setTimeout(()=>closeDropdown('${ddId}'),200)">
+        <div id="${ddId}" class="dci-dropdown"></div></div>`;
+    }
     return`<tr>
-      <td title="${p.name}">${p.name.substring(0,30)}</td>
-      <td style="font-size:11px">${p.dci||'<span style="color:var(--red)">—</span>'}</td>
+      <td title="${p.name}">${p.name.substring(0,35)}</td>
+      <td style="font-size:11px">${p.dci||p.manualCategory?'<span class="cat-badge">'+p.manualCategory+'</span>':'<span style="color:var(--red)">—</span>'}</td>
       <td style="font-size:11px">${p.matchedDosage||extractDosage(p.name)||'-'}</td>
-      <td style="font-size:11px">${p.labo||'-'}</td>
       <td>${conf}</td>
-      <td><input id="dci_${btoa(encodeURIComponent(p.name)).replace(/=/g,'')}" value="${corr.dci||''}" placeholder="${p.dci||'DCI...'}" style="background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:120px"></td>
-      <td><input id="dos_${btoa(encodeURIComponent(p.name)).replace(/=/g,'')}" value="${corr.dosage||''}" placeholder="${p.matchedDosage||extractDosage(p.name)||'Dosage...'}" style="background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:90px"></td>
-      <td><input id="lab_${btoa(encodeURIComponent(p.name)).replace(/=/g,'')}" value="${corr.labo||''}" placeholder="${p.labo||'Labo...'}" style="background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:100px"></td>
-      <td><button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="saveDCICorrection('${escAttr(p.name)}')">💾</button>${corr.dci?` <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:''}</td>
+      <td>${ddField}</td>
+      <td><input id="dos_${key}" value="${corr.dosage||''}" placeholder="${p.matchedDosage||extractDosage(p.name)||'opt.'}" style="background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:80px"></td>
+      <td><button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="saveDCICorrection('${escAttr(p.name)}')">💾</button>${corr.dci||corr.category?` <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:''}</td>
     </tr>`}).join('');
 }
 function saveDCICorrection(name){
   const key=btoa(encodeURIComponent(name)).replace(/=/g,'');
-  const dci=(document.getElementById('dci_'+key)||{}).value;
+  const dciVal=(document.getElementById('dci_'+key)||{}).value;
   const dosage=(document.getElementById('dos_'+key)||{}).value;
-  const labo=(document.getElementById('lab_'+key)||{}).value;
-  if(!dci&&!dosage&&!labo)return;
+  if(!dciVal&&!dosage)return;
   DB.manualDCI[name]={};
-  if(dci)DB.manualDCI[name].dci=san(dci);
+  const valUp=san(dciVal);
+  // Determine if it's a category or a DCI
+  const allCats=[...CATEGORIES_PREDEF,...(DB.manualCategories||[])];
+  const isCategory=allCats.some(c=>c.toUpperCase()===valUp);
+  if(isCategory){
+    DB.manualDCI[name].category=dciVal.trim();
+  } else if(dciVal){
+    // Check if it's a known DCI from dropdown or free text
+    DB.manualDCI[name].dci=valUp;
+    // If it's not in the known list and looks like a new category, still store as DCI
+  }
   if(dosage)DB.manualDCI[name].dosage=san(dosage);
-  if(labo)DB.manualDCI[name].labo=san(labo);
   localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));
-  // Re-apply to product immediately
   const p=DB.products[name];
   if(p){
-    if(dci){p.dci=san(dci);p.category='medicament';}
+    if(isCategory){p.manualCategory=dciVal.trim();p.category='parapharm';}
+    else if(dciVal){p.dci=valUp;p.category='medicament';}
     if(dosage)p.matchedDosage=normalizeDosage(san(dosage));
-    if(labo)p.labo=san(labo);
     p.manualDCI=true;
   }
   updateDCITable();
@@ -1437,7 +1422,6 @@ function saveDCICorrection(name){
 function deleteDCICorrection(name){
   delete DB.manualDCI[name];
   localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));
-  // Need recompute to restore auto-match
   computeAll();updateBadges();
   renderDCIMatch(document.getElementById('mainContent'));
 }
@@ -1486,4 +1470,5 @@ function exportReport(){
 // ==================== INIT ====================
 try{const s=localStorage.getItem('leghrib_pharmacy_settings');if(s){const parsed=JSON.parse(s);Object.assign(DB.settings,parsed);if(parsed.targetMonths)DB.settings.targetMonths={...{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1},...parsed.targetMonths};}}catch(e){}
 try{const mc=localStorage.getItem('leghrib_pharmacy_dci_corrections');if(mc)DB.manualDCI=JSON.parse(mc)}catch(e){}
+try{const cats=localStorage.getItem('leghrib_pharmacy_categories');if(cats)DB.manualCategories=JSON.parse(cats)}catch(e){}
 showPage('import');
