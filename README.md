@@ -44,7 +44,7 @@ L'application **Leghrib Pharmacy V4** est un système complet de gestion prévis
 
 ## Structure des Fichiers
 
-- `index.html` : Page HTML principale avec structure DOM
+- `PharmaPlanv4.html` : Page HTML principale avec structure DOM
 - `styles.css` : Feuille de styles CSS complète
 - `app.js` : Logique applicative JavaScript
 
