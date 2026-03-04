@@ -1,6 +1,6 @@
 // ==================== GLOBAL STATE ====================
 const DB = {
-  rotation: [], monthly: {}, nomenclature: [], nationalDCI: [],
+  rotation: [], monthly: {}, nomenclature: [], nationalDCI: [], clients: [],
   products: {}, suppliers: {}, dciGroups: {},
   settings: {
     alert_rupture:5, alert_securite:15, stock_cible:90, surstock:120, prix_perime_mois:3,
@@ -10,7 +10,7 @@ const DB = {
   manualDCI:{}, // V4: manual DCI corrections + category tags
   manualCategories:[], // V4.1: user-defined custom categories
   uniqueDCINames:[], // V4.1: sorted canonical DCI names for dropdown
-  importStatus: {rotation:false, monthly:0, nomenclature:false, chifaDCI:false},
+  importStatus: {rotation:false, monthly:0, nomenclature:false, chifaDCI:false, clients:false},
   loaded: false
 };
 
@@ -188,6 +188,8 @@ function detectAndImport(raw, fileName, allSheets, sheetNames){
   if(cols.includes('Date')&&(cols.includes('Q.Entrée')||cols.includes('Q.Sortie')))return importMonthly(data,fileName);
   // Rotation: has Q.Stock, Q.Entrées, Q.Sorties
   if(cols.includes('Q.Stock')&&cols.includes('Q.Entrées'))return importRotation(data);
+  // Situation Client: has Nom du client, Impayé
+  if(cols.some(c=>c.includes('Nom du client'))&&cols.some(c=>c.includes('Impayé')))return importClients(data);
   return 'unknown';
 }
 
@@ -227,6 +229,25 @@ function importNomenclature(data){
   }));
   DB.importStatus.nomenclature=true;
   return 'nomenclature';
+}
+
+function importClients(data){
+  DB.clients=data.filter(r=>r['Nom du client']).map(r=>{
+    const phone=r['Téléphone']?String(r['Téléphone']).trim():'';
+    return{
+      name:String(r['Nom du client']).trim(),
+      assure:r['N° Assuré']?String(r['N° Assuré']).trim():'',
+      type:r['Type Client']?String(r['Type Client']).trim():'',
+      phone:phone&&phone!=='0'?phone:'',
+      unpaid:Number(r['Impayé'])||0,
+      unpaidDetail:Number(r['Impayé (Détail)'])||0,
+      lastSale:excelDate(r['Dernière vente']),
+      lastPayment:excelDate(r['Dernière paiement']),
+      lastSMS:excelDate(r['Date du D/SMS'])
+    };
+  }).filter(c=>c.unpaid>0);
+  DB.importStatus.clients=true;
+  return 'clients';
 }
 
 // V4.1: Import Chifa AI DCI database (replaces old national DCI)
@@ -839,7 +860,7 @@ function showPage(page){
   currentPage=page;
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===page));
   const m=document.getElementById('mainContent');
-  ({import:renderImport,dashboard:renderDashboard,alerts:renderAlerts,dciMatch:renderDCIMatch,suppliers:renderSuppliers,purchase:renderPurchase,expiry:renderExpiry,settings:renderSettings})[page](m);
+  ({import:renderImport,dashboard:renderDashboard,alerts:renderAlerts,dciMatch:renderDCIMatch,suppliers:renderSuppliers,purchase:renderPurchase,clients:renderClients,expiry:renderExpiry,settings:renderSettings})[page](m);
 }
 
 // ==================== IMPORT PAGE ====================
@@ -860,6 +881,7 @@ function renderImport(el){
       <div class="import-status"><span class="dot ${s.monthly>0?'dot-green':'dot-gray'}"></span>${s.monthly>0?`✓ Fichiers mensuels — ${s.monthly} mois chargés`:'◯ Fichiers mensuels (historique ventes)'}</div>
       <div class="import-status"><span class="dot ${s.rotation?'dot-green':'dot-gray'}"></span>${s.rotation?`✓ Rotation annuelle — ${DB.rotation.length} produits`:'◯ Rotation annuelle — optionnel (enrichissement DCI/labo)'}</div>
       <div class="import-status"><span class="dot ${s.chifaDCI?'dot-green':'dot-gray'}"></span>${s.chifaDCI?`✓ Médicaments Chifa AI — ${DB.nationalDCI.length} médicaments, ${matched} matchés${s.retraits>0?' | ⛔ '+s.retraits+' retraits chargés':''}`:'◯ Médicaments Chifa AI (base DCI nationale)'}</div>
+      <div class="import-status"><span class="dot ${s.clients?'dot-green':'dot-gray'}"></span>${s.clients?`✓ Situation Client — ${DB.clients.length} clients avec crédit`:'◯ Situation Client (fichier crédit clients)'}</div>
     </div>
     <div style="margin-top:24px;text-align:center">
       <button class="btn btn-primary" onclick="runCompute()" style="padding:12px 32px;font-size:15px" ${!s.nomenclature&&!s.rotation&&s.monthly===0?'disabled style="opacity:.5;padding:12px 32px;font-size:15px"':''}>🔄 Calculer les Prévisions</button>
@@ -887,6 +909,8 @@ async function handleAllFiles(fileList){
     }catch(e){console.error('Error:',files[i].name,e)}
   }
   if(prog)prog.style.display='none';
+  // Update client badge immediately (doesn't need computeAll)
+  if(DB.importStatus.clients){const cb=document.getElementById('clientBadge');if(cb){const crit=DB.clients.filter(c=>getClientFlag(c).level==='critique').length;cb.textContent=crit;cb.style.display=crit>0?'inline':'none'}}
   renderImport(document.getElementById('mainContent'));
 }
 
@@ -894,10 +918,12 @@ function runCompute(){
   const prog=document.getElementById('importProgress');if(prog)prog.style.display='block';
   setTimeout(()=>{computeAll();if(prog)prog.style.display='none';updateBadges();renderImport(document.getElementById('mainContent'))},100);
 }
-function clearAll(){if(!confirm('Supprimer toutes les données ?'))return;DB.rotation=[];DB.monthly={};DB.nomenclature=[];DB.nationalDCI=[];DB.nationalDCI_all=[];DB.retraits=[];DB._withdrawnBrands=new Set();DB.products={};DB.suppliers={};DB.dciGroups={};DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};DB._dciGroups={};DB._categoryGroups={};DB._mergedProducts={};DB.uniqueDCINames=[];DB.importStatus={rotation:false,monthly:0,nomenclature:false,chifaDCI:false,retraits:0};DB.loaded=false;localStorage.clear();updateBadges();renderImport(document.getElementById('mainContent'));}
+function clearAll(){if(!confirm('Supprimer toutes les données ?'))return;DB.rotation=[];DB.monthly={};DB.nomenclature=[];DB.nationalDCI=[];DB.nationalDCI_all=[];DB.retraits=[];DB._withdrawnBrands=new Set();DB.products={};DB.suppliers={};DB.dciGroups={};DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};DB._dciGroups={};DB._categoryGroups={};DB._mergedProducts={};DB.uniqueDCINames=[];DB.clients=[];DB.importStatus={rotation:false,monthly:0,nomenclature:false,chifaDCI:false,retraits:0,clients:false};DB.loaded=false;localStorage.clear();updateBadges();renderImport(document.getElementById('mainContent'));}
 function updateBadges(){if(!DB.loaded)return;const ps=Object.values(DB.products);const a=ps.filter(p=>['rupture','5j'].includes(p.alertLevel)).length;const e=ps.filter(p=>p.expiredQty>0||p.nearExpiryQty>0).length;const ab=document.getElementById('alertBadge'),eb=document.getElementById('expiryBadge'),db=document.getElementById('dciMatchBadge');if(ab){ab.textContent=a;ab.style.display=a>0?'inline':'none'}if(eb){eb.textContent=e;eb.style.display=e>0?'inline':'none'}
 // V4: DCI unmatched badge
-if(db){const unmatched=ps.filter(p=>p.alertLevel!=='dead'&&!p.dci&&!p.withdrawn).length;db.textContent=unmatched;db.style.display=unmatched>0?'inline':'none'}}
+if(db){const unmatched=ps.filter(p=>p.alertLevel!=='dead'&&!p.dci&&!p.withdrawn).length;db.textContent=unmatched;db.style.display=unmatched>0?'inline':'none'}
+// Client badge
+const cb=document.getElementById('clientBadge');if(cb&&DB.clients.length>0){const crit=DB.clients.filter(c=>getClientFlag(c).level==='critique').length;cb.textContent=crit;cb.style.display=crit>0?'inline':'none'}}
 
 // ==================== DASHBOARD ====================
 function renderDashboard(el){
@@ -1064,7 +1090,7 @@ function showDetail(name){
       <div class="detail-stat"><div class="label">Stock Effectif</div><div class="value">${fmt(p.effectiveStock)}</div></div>
       <div class="detail-stat"><div class="label">Conso/jour</div><div class="value">${p.dailyConsumption.toFixed(1)}</div></div>
       <div class="detail-stat"><div class="label">Jours Restants</div><div class="value" style="color:${p.daysRemaining<=5?'var(--red)':p.daysRemaining<=15?'var(--orange)':'var(--green)'}">${p.daysRemaining>9e3?'∞':Math.round(p.daysRemaining)+'j'}</div></div>
-      <div class="detail-stat"><div class="label">Stock Cible 3m</div><div class="value">${fmt(p.targetStock)}</div></div>
+      <div class="detail-stat"><div class="label">Stock Cible ${p._targetMonths||3}m</div><div class="value">${fmt(p.targetStock)}</div></div>
       <div class="detail-stat"><div class="label">Qté à Commander</div><div class="value" style="color:var(--accent)">${p.withdrawn?'<span style="color:#94a3b8">⛔ Retiré</span>':p.dciGroupCovered?'<span style="color:var(--cyan)">DCI ✓</span>':fmt(p.suggestedPurchase)}</div></div>
       <div class="detail-stat"><div class="label">Classification</div><div class="value"><span class="abc-badge abc-${p.abc} xyz-${p.xyz}" style="font-size:14px;padding:3px 8px">${p.abc}${p.xyz}</span></div></div>
       <div class="detail-stat"><div class="label">Tendance</div><div class="value" style="color:${p.trend>1.1?'var(--green)':p.trend<0.9?'var(--red)':'var(--text2)'}">${p.trend>1.1?'↑':p.trend<0.9?'↓':'→'} ${((p.trend-1)*100).toFixed(0)}%</div></div>
@@ -1341,6 +1367,9 @@ function renderDCIMatch(el){
     <div class="table-wrap">
       <div class="table-toolbar">
         <input id="dciSearchInput" placeholder="🔍 Rechercher produit, DCI, catégorie..." value="${dciSearch}" oninput="dciSearch=this.value;updateDCITable()">
+        <button class="btn btn-secondary" onclick="exportCorrections()">📥 Exporter Corrections</button>
+        <button class="btn btn-secondary" onclick="document.getElementById('corrImport').click()">📤 Importer Corrections</button>
+        <input type="file" id="corrImport" class="hidden-input" accept=".json" onchange="importCorrections(this.files[0])">
       </div>
       <div class="table-scroll" style="max-height:calc(100vh - 420px)"><table>
         <thead><tr><th>Produit</th><th>DCI Auto</th><th>Dosage</th><th>Confiance</th><th>Correction DCI / Catégorie</th><th>Dosage (opt.)</th><th>Action</th></tr></thead>
@@ -1361,34 +1390,24 @@ function updateDCITable(){
   tbody.innerHTML=ps.slice(0,200).map(p=>{
     const key=btoa(encodeURIComponent(p.name)).replace(/=/g,'');
     const corr=DB.manualDCI[p.name]||{};
-    const isArticle=!p.dci&&p.category!=='medicament'&&!corr.dci;
-    const conf=p.manualCategory?'<span class="dci-confidence dci-manual">✦ Catégorie</span>':p.manualDCI?'<span class="dci-confidence dci-manual">✎ Manuel</span>':p.dci?'<span class="dci-confidence dci-exact">✓ Auto</span>':'<span class="dci-confidence dci-none">✗ Aucun</span>';
-    // Dropdown: DCI for medicines, Category for articles
+    const conf=p.manualCategory?'<span class="dci-confidence dci-manual">✦ Article</span>':p.manualDCI?'<span class="dci-confidence dci-manual">✎ Manuel</span>':p.dci?'<span class="dci-confidence dci-exact">✓ Auto</span>':'<span class="dci-confidence dci-none">✗ Aucun</span>';
     const ddId='dd_'+key;
     const inpId='dci_'+key;
-    let ddField;
-    if(isArticle||corr.category){
-      ddField=`<div class="dci-autocomplete"><input id="${inpId}" value="${corr.category||''}" placeholder="Catégorie..." class="dci-input" autocomplete="off"
-        oninput="filterDropdown('${inpId}','${ddId}',${JSON.stringify(allCats).replace(/"/g,'&quot;')},this.value)"
-        onfocus="filterDropdown('${inpId}','${ddId}',${JSON.stringify(allCats).replace(/"/g,'&quot;')},this.value)"
-        onblur="setTimeout(()=>closeDropdown('${ddId}'),200)">
-        <div id="${ddId}" class="dci-dropdown"></div></div>`;
-    } else {
-      const dciList='DB.uniqueDCINames';
-      ddField=`<div class="dci-autocomplete"><input id="${inpId}" value="${corr.dci||''}" placeholder="${p.dci||'DCI...'}" class="dci-input" autocomplete="off"
-        oninput="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
-        onfocus="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
-        onblur="setTimeout(()=>closeDropdown('${ddId}'),200)">
-        <div id="${ddId}" class="dci-dropdown"></div></div>`;
-    }
+    // All products get the DCI dropdown from Chifa AI database
+    const dciList='DB.uniqueDCINames';
+    const ddField=`<div class="dci-autocomplete"><input id="${inpId}" value="${corr.dci||''}" placeholder="${p.dci||'Chercher DCI...'}" class="dci-input" autocomplete="off"
+      oninput="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
+      onfocus="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
+      onblur="setTimeout(()=>closeDropdown('${ddId}'),200)"${p.manualCategory?' disabled style="opacity:.4"':''}>
+      <div id="${ddId}" class="dci-dropdown"></div></div>`;
     return`<tr>
       <td title="${p.name}">${p.name.substring(0,35)}</td>
-      <td style="font-size:11px">${p.dci||p.manualCategory?'<span class="cat-badge">'+p.manualCategory+'</span>':'<span style="color:var(--red)">—</span>'}</td>
+      <td style="font-size:11px">${p.manualCategory?'<span class="cat-badge">'+p.manualCategory+'</span>':p.dci?p.dci:'<span style="color:var(--red)">—</span>'}</td>
       <td style="font-size:11px">${p.matchedDosage||extractDosage(p.name)||'-'}</td>
       <td>${conf}</td>
       <td>${ddField}</td>
       <td><input id="dos_${key}" value="${corr.dosage||''}" placeholder="${p.matchedDosage||extractDosage(p.name)||'opt.'}" style="background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:80px"></td>
-      <td><button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="saveDCICorrection('${escAttr(p.name)}')">💾</button>${corr.dci||corr.category?` <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:''}</td>
+      <td>${p.manualCategory==='Article'?`<span class="cat-badge">Article</span> <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:`<button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="saveDCICorrection('${escAttr(p.name)}')">💾</button> <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="markAsArticle('${escAttr(p.name)}')">🏷️ Article</button>${corr.dci||corr.category?` <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:''}`}</td>
     </tr>`}).join('');
 }
 function saveDCICorrection(name){
@@ -1398,22 +1417,13 @@ function saveDCICorrection(name){
   if(!dciVal&&!dosage)return;
   DB.manualDCI[name]={};
   const valUp=san(dciVal);
-  // Determine if it's a category or a DCI
-  const allCats=[...CATEGORIES_PREDEF,...(DB.manualCategories||[])];
-  const isCategory=allCats.some(c=>c.toUpperCase()===valUp);
-  if(isCategory){
-    DB.manualDCI[name].category=dciVal.trim();
-  } else if(dciVal){
-    // Check if it's a known DCI from dropdown or free text
-    DB.manualDCI[name].dci=valUp;
-    // If it's not in the known list and looks like a new category, still store as DCI
-  }
+  // DCI correction — input is always a DCI name (articles use markAsArticle button)
+  if(dciVal)DB.manualDCI[name].dci=valUp;
   if(dosage)DB.manualDCI[name].dosage=san(dosage);
   localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));
   const p=DB.products[name];
   if(p){
-    if(isCategory){p.manualCategory=dciVal.trim();p.category='parapharm';}
-    else if(dciVal){p.dci=valUp;p.category='medicament';}
+    if(dciVal){p.dci=valUp;p.category='medicament';p.manualCategory=null;}
     if(dosage)p.matchedDosage=normalizeDosage(san(dosage));
     p.manualDCI=true;
   }
@@ -1424,6 +1434,173 @@ function deleteDCICorrection(name){
   localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));
   computeAll();updateBadges();
   renderDCIMatch(document.getElementById('mainContent'));
+}
+function markAsArticle(name){
+  DB.manualDCI[name]={category:'Article'};
+  localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));
+  const p=DB.products[name];
+  if(p){p.manualCategory='Article';p.category='parapharm';p.manualDCI=true;}
+  updateBadges();updateDCITable();
+}
+function exportCorrections(){
+  const data={manualDCI:DB.manualDCI,manualCategories:DB.manualCategories||[],settings:DB.settings};
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=`LeghribPharmacy_Corrections_${new Date().toISOString().slice(0,10)}.json`;
+  a.click();URL.revokeObjectURL(a.href);
+}
+function importCorrections(file){
+  if(!file)return;
+  const r=new FileReader();
+  r.onload=e=>{
+    try{
+      const data=JSON.parse(e.target.result);
+      if(data.manualDCI){DB.manualDCI={...DB.manualDCI,...data.manualDCI};localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));}
+      if(data.manualCategories){DB.manualCategories=[...new Set([...(DB.manualCategories||[]),...data.manualCategories])];localStorage.setItem('leghrib_pharmacy_categories',JSON.stringify(DB.manualCategories));}
+      if(data.settings){Object.assign(DB.settings,data.settings);localStorage.setItem('leghrib_pharmacy_settings',JSON.stringify(DB.settings));}
+      if(DB.loaded){computeAll();updateBadges();}
+      renderDCIMatch(document.getElementById('mainContent'));
+      alert('✓ '+Object.keys(data.manualDCI||{}).length+' corrections importées avec succès');
+    }catch(err){alert('Erreur: fichier invalide — '+err.message);}
+  };
+  r.readAsText(file);
+}
+
+// ==================== SITUATION CLIENT ====================
+let clientsFilter={search:'',level:'all'},clientsPage=0,clientsSortCol=null,clientsSortDir=1;
+
+function getClientFlag(c){
+  const now=new Date();
+  const daysSale=c.lastSale?Math.floor((now-c.lastSale)/864e5):null;
+  const daysPay=c.lastPayment?Math.floor((now-c.lastPayment)/864e5):null;
+  // No dates at all
+  if(daysSale===null&&daysPay===null)return{level:'jamais',label:'Jamais',color:'var(--text3)',cls:'alert-withdrawn'};
+  // Critique: no payment AND no purchase > 4 months (120 days)
+  const noPayLong=(daysPay===null||daysPay>120);
+  const noSaleLong=(daysSale===null||daysSale>120);
+  if(noPayLong&&noSaleLong)return{level:'critique',label:'Critique',color:'var(--red)',cls:'alert-rupture'};
+  // À relancer: no payment > 2 months OR no purchase > 2 months (60 days)
+  if((daysPay===null||daysPay>60)||(daysSale===null||daysSale>60))return{level:'relancer',label:'À relancer',color:'var(--orange)',cls:'alert-5j'};
+  // Récent
+  return{level:'recent',label:'Récent',color:'var(--green)',cls:'alert-ok'};
+}
+
+function renderClients(el){
+  if(!DB.importStatus.clients||!DB.clients.length){
+    el.innerHTML='<p style="padding:40px;text-align:center;color:var(--text3)">Importez le fichier Situation Client (.xlsx) depuis la page Importation.</p>';return;
+  }
+  const now=new Date();
+  const all=DB.clients.map(c=>{
+    const flag=getClientFlag(c);
+    const daysSale=c.lastSale?Math.floor((now-c.lastSale)/864e5):null;
+    const daysPay=c.lastPayment?Math.floor((now-c.lastPayment)/864e5):null;
+    return{...c,flag,daysSale,daysPay};
+  });
+  const critique=all.filter(c=>c.flag.level==='critique');
+  const relancer=all.filter(c=>c.flag.level==='relancer');
+  const recent=all.filter(c=>c.flag.level==='recent');
+  const jamais=all.filter(c=>c.flag.level==='jamais');
+  const totalUnpaid=all.reduce((a,c)=>a+c.unpaid,0);
+  const noPhone=all.filter(c=>!c.phone).length;
+
+  el.innerHTML=`
+    <h2 class="page-title">Situation Client — Crédit & Relance</h2>
+    <p class="page-subtitle">${fmt(all.length)} clients avec crédit — Total impayé: ${fmtDA(totalUnpaid)}</p>
+    <div class="cards">
+      <div class="card red"><div class="card-label">Critique (>4 mois)</div><div class="card-value">${critique.length}</div><div class="card-sub">${fmtDA(critique.reduce((a,c)=>a+c.unpaid,0))}</div></div>
+      <div class="card orange"><div class="card-label">À Relancer (>2 mois)</div><div class="card-value">${relancer.length}</div><div class="card-sub">${fmtDA(relancer.reduce((a,c)=>a+c.unpaid,0))}</div></div>
+      <div class="card green"><div class="card-label">Récent (<2 mois)</div><div class="card-value">${recent.length}</div><div class="card-sub">${fmtDA(recent.reduce((a,c)=>a+c.unpaid,0))}</div></div>
+      <div class="card"><div class="card-label">Jamais (aucune date)</div><div class="card-value" style="color:var(--text3)">${jamais.length}</div></div>
+      <div class="card purple"><div class="card-label">Total Impayé</div><div class="card-value" style="font-size:18px">${fmtDA(totalUnpaid)}</div></div>
+      <div class="card"><div class="card-label">Sans Téléphone</div><div class="card-value" style="color:var(--text3)">${noPhone}</div></div>
+    </div>
+    <div class="table-wrap">
+      <div class="table-toolbar">
+        <input id="clientSearchInput" placeholder="🔍 Rechercher client, téléphone..." value="${clientsFilter.search}" oninput="clientsFilter.search=this.value;clientsPage=0;updateClientsTable()">
+        <select onchange="clientsFilter.level=this.value;clientsPage=0;updateClientsTable()">
+          <option value="all"${clientsFilter.level==='all'?' selected':''}>Tous</option>
+          <option value="critique"${clientsFilter.level==='critique'?' selected':''}>🔴 Critique</option>
+          <option value="relancer"${clientsFilter.level==='relancer'?' selected':''}>🟠 À relancer</option>
+          <option value="recent"${clientsFilter.level==='recent'?' selected':''}>🟢 Récent</option>
+          <option value="jamais"${clientsFilter.level==='jamais'?' selected':''}>⚫ Jamais</option>
+        </select>
+        <button class="btn btn-secondary" onclick="exportClients()">📥 Exporter Excel</button>
+      </div>
+      <div class="table-scroll"><table>
+        <thead><tr>
+          <th onclick="toggleClientSort('flag')">Flag${clientsSortCol==='flag'?(clientsSortDir===1?' ▲':' ▼'):''}</th>
+          <th onclick="toggleClientSort('name')">Client${clientsSortCol==='name'?(clientsSortDir===1?' ▲':' ▼'):''}</th>
+          <th>Type</th>
+          <th>Téléphone</th>
+          <th onclick="toggleClientSort('unpaid')">Impayé${clientsSortCol==='unpaid'?(clientsSortDir===1?' ▲':' ▼'):''}</th>
+          <th onclick="toggleClientSort('daysSale')">Dernière Vente${clientsSortCol==='daysSale'?(clientsSortDir===1?' ▲':' ▼'):''}</th>
+          <th onclick="toggleClientSort('daysPay')">Dernier Paiement${clientsSortCol==='daysPay'?(clientsSortDir===1?' ▲':' ▼'):''}</th>
+          <th>J. sans achat</th>
+          <th>J. sans paiement</th>
+        </tr></thead>
+        <tbody id="clientsTableBody"></tbody>
+      </table></div>
+      <div id="clientsPagination"></div>
+    </div>`;
+  updateClientsTable();
+}
+
+function updateClientsTable(){
+  const now=new Date();
+  let cs=DB.clients.map(c=>{
+    const flag=getClientFlag(c);
+    const daysSale=c.lastSale?Math.floor((now-c.lastSale)/864e5):null;
+    const daysPay=c.lastPayment?Math.floor((now-c.lastPayment)/864e5):null;
+    return{...c,flag,daysSale,daysPay};
+  });
+  if(clientsFilter.search){const q=clientsFilter.search.toUpperCase();cs=cs.filter(c=>c.name.toUpperCase().includes(q)||(c.phone&&c.phone.includes(q)))}
+  if(clientsFilter.level!=='all')cs=cs.filter(c=>c.flag.level===clientsFilter.level);
+  // Sort
+  const flagOrder={critique:0,relancer:1,jamais:2,recent:3};
+  if(clientsSortCol==='flag')cs.sort((a,b)=>clientsSortDir*((flagOrder[a.flag.level]||9)-(flagOrder[b.flag.level]||9))||b.unpaid-a.unpaid);
+  else if(clientsSortCol==='name')cs.sort((a,b)=>clientsSortDir*a.name.localeCompare(b.name));
+  else if(clientsSortCol==='unpaid')cs.sort((a,b)=>clientsSortDir*(a.unpaid-b.unpaid));
+  else if(clientsSortCol==='daysSale')cs.sort((a,b)=>clientsSortDir*((b.daysSale||9999)-(a.daysSale||9999)));
+  else if(clientsSortCol==='daysPay')cs.sort((a,b)=>clientsSortDir*((b.daysPay||9999)-(a.daysPay||9999)));
+  else cs.sort((a,b)=>(flagOrder[a.flag.level]||9)-(flagOrder[b.flag.level]||9)||b.unpaid-a.unpaid);
+  // Pagination
+  const tp=Math.max(1,Math.ceil(cs.length/ROWS));clientsPage=Math.min(clientsPage,tp-1);if(clientsPage<0)clientsPage=0;
+  const page=cs.slice(clientsPage*ROWS,(clientsPage+1)*ROWS);
+  const tbody=document.getElementById('clientsTableBody');
+  if(tbody)tbody.innerHTML=page.map(c=>`<tr style="cursor:pointer${c.flag.level==='critique'?';background:rgba(239,68,68,.04)':c.flag.level==='relancer'?';background:rgba(249,115,22,.03)':''}" onclick="if('${c.phone}')navigator.clipboard.writeText('${c.phone}')">
+    <td><span class="alert-badge ${c.flag.cls}">${c.flag.label}</span></td>
+    <td title="${c.name}">${c.name.substring(0,30)}${c.name.length>30?'..':''}</td>
+    <td style="font-size:11px;color:var(--text3)">${c.type}</td>
+    <td style="font-weight:${c.phone?'600':'400'};color:${c.phone?'var(--accent)':'var(--text3)'}">${c.phone||'—'}</td>
+    <td style="font-weight:600">${fmtDA(c.unpaid)}</td>
+    <td style="color:${c.daysSale&&c.daysSale>120?'var(--red)':c.daysSale&&c.daysSale>60?'var(--orange)':'var(--text2)'}">${c.lastSale?c.lastSale.toLocaleDateString('fr-FR'):'—'}</td>
+    <td style="color:${c.daysPay&&c.daysPay>120?'var(--red)':c.daysPay&&c.daysPay>60?'var(--orange)':'var(--text2)'}">${c.lastPayment?c.lastPayment.toLocaleDateString('fr-FR'):'—'}</td>
+    <td style="color:${c.daysSale&&c.daysSale>120?'var(--red)':c.daysSale&&c.daysSale>60?'var(--orange)':'var(--text2)'}">${c.daysSale!=null?c.daysSale+'j':'—'}</td>
+    <td style="color:${c.daysPay&&c.daysPay>120?'var(--red)':c.daysPay&&c.daysPay>60?'var(--orange)':'var(--text2)'}">${c.daysPay!=null?c.daysPay+'j':'—'}</td>
+  </tr>`).join('');
+  const pag=document.getElementById('clientsPagination');
+  if(pag)pag.innerHTML=tp>1?`<div class="pagination"><button ${clientsPage===0?'disabled':''} onclick="clientsPage=0;updateClientsTable()">«</button><button ${clientsPage===0?'disabled':''} onclick="clientsPage--;updateClientsTable()">‹</button><span class="page-info">Page ${clientsPage+1}/${tp} (${fmt(cs.length)} clients)</span><button ${clientsPage>=tp-1?'disabled':''} onclick="clientsPage++;updateClientsTable()">›</button><button ${clientsPage>=tp-1?'disabled':''} onclick="clientsPage=${tp-1};updateClientsTable()">»</button></div>`:'';
+}
+
+function toggleClientSort(c){if(clientsSortCol===c)clientsSortDir*=-1;else{clientsSortCol=c;clientsSortDir=c==='name'?1:-1}updateClientsTable()}
+
+function exportClients(){
+  if(!DB.clients.length)return;
+  const now=new Date();
+  const flagOrder={critique:0,relancer:1,jamais:2,recent:3};
+  const rows=DB.clients.map(c=>{
+    const flag=getClientFlag(c);
+    const daysSale=c.lastSale?Math.floor((now-c.lastSale)/864e5):null;
+    const daysPay=c.lastPayment?Math.floor((now-c.lastPayment)/864e5):null;
+    return{...c,flag,daysSale,daysPay};
+  }).filter(c=>{
+    if(clientsFilter.level!=='all')return c.flag.level===clientsFilter.level;
+    return true;
+  }).sort((a,b)=>(flagOrder[a.flag.level]||9)-(flagOrder[b.flag.level]||9)||b.unpaid-a.unpaid);
+  const d=[['Statut','Client','Type','Téléphone','Impayé','Dernière Vente','Dernier Paiement','Jours sans achat','Jours sans paiement']];
+  rows.forEach(c=>d.push([c.flag.label,c.name,c.type,c.phone||'',c.unpaid,c.lastSale?c.lastSale.toLocaleDateString('fr-FR'):'',c.lastPayment?c.lastPayment.toLocaleDateString('fr-FR'):'',c.daysSale!=null?c.daysSale:'',c.daysPay!=null?c.daysPay:'']));
+  const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(d),'Relance Clients');
+  XLSX.writeFile(wb,`LeghribPharmacy_Relance_${new Date().toISOString().slice(0,10)}.xlsx`);
 }
 
 // ==================== SETTINGS ====================
