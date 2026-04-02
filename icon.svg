@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Background -->
+  <rect width="512" height="512" rx="76" fill="#0f172a"/>
+
+  <!-- Four-shape logo matching the sidebar design -->
+  <!-- Top-left: Teal rectangle -->
+  <rect x="80" y="80" width="140" height="140" rx="20" fill="#5FBCA7"/>
+
+  <!-- Top-right: Darker teal circle -->
+  <circle cx="360" cy="150" r="70" fill="#2FB194"/>
+
+  <!-- Bottom-left: Medium teal rectangle -->
+  <rect x="80" y="280" width="140" height="140" rx="20" fill="#2FB194"/>
+
+  <!-- Bottom-right: Dark navy rectangle -->
+  <rect x="280" y="280" width="140" height="140" rx="20" fill="#083D2E"/>
+
+  <!-- Pharmacy cross overlay (white) -->
+  <g transform="translate(256, 256)">
+    <!-- Horizontal bar of cross -->
+    <rect x="-50" y="-15" width="100" height="30" fill="white" opacity="0.95"/>
+    <!-- Vertical bar of cross -->
+    <rect x="-15" y="-50" width="30" height="100" fill="white" opacity="0.95"/>
+  </g>
+</svg>

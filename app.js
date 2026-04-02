@@ -21,6 +21,18 @@ const pct = n => n==null||isNaN(n)?'-':(n*100).toFixed(1)+'%';
 const san = s => s?String(s).trim().toUpperCase():'';
 const escAttr = s => s.replace(/'/g,"\\'").replace(/"/g,'&quot;');
 
+// HTML escaping to prevent XSS from user-supplied data (product names, supplier names, etc.)
+function escHTML(s){
+  if(s==null)return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+// Safe truncation with HTML escaping
+function escTrunc(s,max){
+  if(!s)return '';
+  if(s.length<=max)return escHTML(s);
+  return escHTML(s.substring(0,max))+'..';
+}
+
 function excelDate(v){
   if(v instanceof Date)return v;
   if(typeof v==='number')return new Date((v-25569)*864e5);
@@ -149,6 +161,7 @@ function parseXLSX(file){
 }
 
 function detectAndImport(raw, fileName, allSheets, sheetNames){
+  try{
   // Find header row (first row with at least 4 non-null values that look like headers)
   let headerIdx=0;
   for(let i=0;i<Math.min(20,raw.length);i++){
@@ -191,6 +204,10 @@ function detectAndImport(raw, fileName, allSheets, sheetNames){
   // Situation Client: has Nom du client, Impayé
   if(cols.some(c=>c.includes('Nom du client'))&&cols.some(c=>c.includes('Impayé')))return importClients(data);
   return 'unknown';
+  }catch(err){
+    console.error('detectAndImport error:',fileName,err);
+    return 'unknown';
+  }
 }
 
 function importRotation(data){
@@ -199,6 +216,7 @@ function importRotation(data){
     entries:Number(r['Q.Entrées'])||0,exits:Number(r['Q.Sorties'])||0,
     dci:r.dci?san(r.dci):null,labo:r.labo?san(r.labo):null
   }));
+  if(DB.rotation.length===0){console.warn('Rotation: aucun produit valide trouvé');return 'unknown';}
   DB.importStatus.rotation=true;
   return 'rotation';
 }
@@ -213,6 +231,7 @@ function importMonthly(data,fileName){
       type:r['T']||null,lot:r['N°Lot']?String(r['N°Lot']):null,
       peremption:excelDate(r['Pér.']),barcode:r['Code barre']?String(r['Code barre']):null};
   });
+  if(rows.length===0){console.warn('Monthly: aucune ligne valide trouvée');return 'unknown';}
   const mk=rows.find(r=>r.mk)?.mk||fileName;
   DB.monthly[mk]=(DB.monthly[mk]||[]).concat(rows);
   DB.importStatus.monthly=Object.keys(DB.monthly).length;
@@ -227,6 +246,7 @@ function importNomenclature(data){
     dateAchat:excelDate(r['Date Achat']),fb:r['F/B']||null,
     shp:Number(r['SHP'])||0,barcode:r['Code barre']?String(r['Code barre']):null
   }));
+  if(DB.nomenclature.length===0){console.warn('Nomenclature: aucun lot valide trouvé');return 'unknown';}
   DB.importStatus.nomenclature=true;
   return 'nomenclature';
 }
@@ -246,6 +266,7 @@ function importClients(data){
       lastSMS:excelDate(r['Date du D/SMS'])
     };
   }).filter(c=>c.unpaid>0);
+  if(DB.clients.length===0){console.warn('Clients: aucun client avec crédit trouvé');return 'unknown';}
   DB.importStatus.clients=true;
   return 'clients';
 }
@@ -345,6 +366,7 @@ function importChifaDCI(raw,headerIdx,fileName,allSheets,sheetNames){
     const preciseKey=item.brand+'|'+normalizeDosage(item.dosage);
     if(DB._withdrawnBrands.has(preciseKey)||DB._withdrawnBrands.has(item.brand))item.withdrawn=true;
   });
+  if(items.length===0){console.warn('ChifaDCI: aucun article valide trouvé');return 'unknown';}
   DB.nationalDCI=items.filter(item=>!item.withdrawn);
   DB.nationalDCI_all=items;
   DB.importStatus.chifaDCI=true;
@@ -468,6 +490,7 @@ function getGenericsForDCI(dci,dosage){
 
 // ==================== COMPUTATION ENGINE ====================
 function computeAll(){
+  try{
   const products={};
   const now=new Date();
   const sortedMonths=Object.keys(DB.monthly).sort();
@@ -849,7 +872,11 @@ function computeAll(){
   });
 
   DB.products=products;DB.loaded=true;
-  localStorage.setItem('leghrib_pharmacy_settings',JSON.stringify(DB.settings));
+  persistSettings();
+  }catch(err){
+    console.error('computeAll error:',err);
+    alert('Erreur lors du calcul: '+err.message+'\nVérifiez vos fichiers importés.');
+  }
 }
 
 // ==================== PAGE RENDERING ====================
@@ -906,9 +933,10 @@ async function handleAllFiles(fileList){
       const {raw,allSheets,sheetNames}=await parseXLSX(files[i]);
       const type=detectAndImport(raw,files[i].name,allSheets,sheetNames);
       results[type]=(results[type]||0)+1;
-    }catch(e){console.error('Error:',files[i].name,e)}
+    }catch(e){console.error('Import error:',files[i].name,e);results.unknown++;}
   }
   if(prog)prog.style.display='none';
+  if(results.unknown>0){alert('⚠ '+results.unknown+' fichier(s) non reconnu(s) ou en erreur. Vérifiez le format.');}
   // Update client badge immediately (doesn't need computeAll)
   if(DB.importStatus.clients){const cb=document.getElementById('clientBadge');if(cb){const crit=DB.clients.filter(c=>getClientFlag(c).level==='critique').length;cb.textContent=crit;cb.style.display=crit>0?'inline':'none'}}
   renderImport(document.getElementById('mainContent'));
@@ -918,7 +946,7 @@ function runCompute(){
   const prog=document.getElementById('importProgress');if(prog)prog.style.display='block';
   setTimeout(()=>{computeAll();if(prog)prog.style.display='none';updateBadges();renderImport(document.getElementById('mainContent'))},100);
 }
-function clearAll(){if(!confirm('Supprimer toutes les données ?'))return;DB.rotation=[];DB.monthly={};DB.nomenclature=[];DB.nationalDCI=[];DB.nationalDCI_all=[];DB.retraits=[];DB._withdrawnBrands=new Set();DB.products={};DB.suppliers={};DB.dciGroups={};DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};DB._dciGroups={};DB._categoryGroups={};DB._mergedProducts={};DB.uniqueDCINames=[];DB.clients=[];DB.importStatus={rotation:false,monthly:0,nomenclature:false,chifaDCI:false,retraits:0,clients:false};DB.loaded=false;localStorage.clear();updateBadges();renderImport(document.getElementById('mainContent'));}
+function clearAll(){if(!confirm('Supprimer toutes les données ?'))return;DB.rotation=[];DB.monthly={};DB.nomenclature=[];DB.nationalDCI=[];DB.nationalDCI_all=[];DB.retraits=[];DB._withdrawnBrands=new Set();DB.products={};DB.suppliers={};DB.dciGroups={};DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};DB._dciGroups={};DB._categoryGroups={};DB._mergedProducts={};DB.uniqueDCINames=[];DB.clients=[];DB.importStatus={rotation:false,monthly:0,nomenclature:false,chifaDCI:false,retraits:0,clients:false};DB.loaded=false;localStorage.clear();idbClear().catch(()=>{});updateBadges();renderImport(document.getElementById('mainContent'));}
 function updateBadges(){if(!DB.loaded)return;const ps=Object.values(DB.products);const a=ps.filter(p=>['rupture','5j'].includes(p.alertLevel)).length;const e=ps.filter(p=>p.expiredQty>0||p.nearExpiryQty>0).length;const ab=document.getElementById('alertBadge'),eb=document.getElementById('expiryBadge'),db=document.getElementById('dciMatchBadge');if(ab){ab.textContent=a;ab.style.display=a>0?'inline':'none'}if(eb){eb.textContent=e;eb.style.display=e>0?'inline':'none'}
 // V4: DCI unmatched badge
 if(db){const unmatched=ps.filter(p=>p.alertLevel!=='dead'&&!p.dci&&!p.withdrawn).length;db.textContent=unmatched;db.style.display=unmatched>0?'inline':'none'}
@@ -1017,7 +1045,7 @@ function updateAlertsTable(){
   const tbody=document.getElementById('alertsTableBody');
   if(tbody)tbody.innerHTML=page.map(p=>`<tr onclick="showDetail('${escAttr(p.name)}')" style="cursor:pointer${p.withdrawn?';opacity:.5;text-decoration:line-through':''}">
           <td><div class="risk-bar"><div class="risk-fill" style="width:${p.riskScore}%;background:${p.riskScore>=70?'#ef4444':p.riskScore>=50?'#f97316':p.riskScore>=30?'#eab308':'#22c55e'}"></div></div>${p.riskScore}</td>
-          <td title="${p.name}${p.withdrawn?' ⛔ RETIRÉ DU MARCHÉ':''}">${p.withdrawn?'⛔ ':''}${p.name.substring(0,33)}${p.name.length>33?'..':''}</td>
+          <td title="${escHTML(p.name)}${p.withdrawn?' ⛔ RETIRÉ DU MARCHÉ':''}">${p.withdrawn?'⛔ ':''}${escTrunc(p.name,33)}</td>
           <td><span class="abc-badge abc-${p.abc} xyz-${p.xyz}">${p.abc}${p.xyz}</span></td>
           <td>${fmt(p.effectiveStock)}${p.expiredQty>0?' <span style="color:var(--red);font-size:10px">(-'+p.expiredQty+')</span>':''}</td>
           <td>${p.dailyConsumption>0?p.dailyConsumption.toFixed(1):'-'}</td>
@@ -1025,7 +1053,7 @@ function updateAlertsTable(){
           <td><span class="alert-badge alert-${p.alertLevel}">${p.alertLabel}</span></td>
           <td style="font-weight:${p.suggestedPurchase>0?'600':'400'}">${p.dciGroupCovered?'<span class="dci-group-badge dci-covered">DCI ✓</span>':p.suggestedPurchase>0?fmt(p.suggestedPurchase):'-'}</td>
           <td>${p.dciGroupCovered?'-':p.purchaseCost>0?fmtDA(p.purchaseCost):'-'}</td>
-          <td>${p.dci?`<span class="dci-group-badge ${p.dciGroupCovered?'dci-covered':p.dciGroupDays&&p.dciGroupDays<30?'dci-partial':'dci-alone'}" title="${p.dci} ${p.matchedDosage||''}">${p.dciGroupCount||1} gén. ${p.matchedDosage||''}${p.dciGroupDays!=null&&p.dciGroupDays<9e3?' '+Math.round(p.dciGroupDays)+'j':''}</span>`:'-'}</td>
+          <td>${p.dci?`<span class="dci-group-badge ${p.dciGroupCovered?'dci-covered':p.dciGroupDays&&p.dciGroupDays<30?'dci-partial':'dci-alone'}" title="${escHTML(p.dci)} ${escHTML(p.matchedDosage)||''}">${p.dciGroupCount||1} gén. ${escHTML(p.matchedDosage)||''}${p.dciGroupDays!=null&&p.dciGroupDays<9e3?' '+Math.round(p.dciGroupDays)+'j':''}</span>`:'-'}</td>
           <td style="color:${p.trend>1.1?'var(--green)':p.trend<0.9?'var(--red)':'var(--text2)'}">${p.trend>1.1?'↑':p.trend<0.9?'↓':'→'} ${((p.trend-1)*100).toFixed(0)}%</td>
         </tr>`).join('');
   const pag=document.getElementById('alertsPagination');
@@ -1049,7 +1077,7 @@ function showDetail(name){
       const isStale=s.latestDate&&(now-s.latestDate)>staleMs;
       const dateStr=s.latestDate?s.latestDate.toLocaleDateString('fr-FR'):'N/A';
       return`<div class="supplier-row ${i===0?'best':i===1?'second':''}">
-        <span class="supplier-name">${s.name}${i===0?' ✅ Meilleur':i===1?' 🥈 2ème':''}</span>
+        <span class="supplier-name">${escHTML(s.name)}${i===0?' ✅ Meilleur':i===1?' 🥈 2ème':''}</span>
         <span class="supplier-price ${isStale?'price-old':i===0?'price-best':i===1?'price-second':''}">${fmtDA(s.latestPrice)}</span>
         <span class="supplier-date ${isStale?'price-old':''}">${dateStr}${isStale?' ⚠':''}  </span>
         <span style="font-size:11px;color:var(--text3)">×${s.entries}</span>
@@ -1064,10 +1092,10 @@ function showDetail(name){
     const group=DB._dciGroups[gKey];
     if(group){
       // Products in our inventory with same DCI+dosage
-      dciHTML=`<h4 style="margin-top:16px;font-size:13px;color:var(--text2)">Génériques en Stock: ${p.dci} ${p.matchedDosage} (${group.products.length} produits en inventaire, couverture: ${group.groupDays>9e3?'∞':Math.round(group.groupDays)+'j'})</h4>
+      dciHTML=`<h4 style="margin-top:16px;font-size:13px;color:var(--text2)">Génériques en Stock: ${escHTML(p.dci)} ${escHTML(p.matchedDosage)} (${group.products.length} produits en inventaire, couverture: ${group.groupDays>9e3?'∞':Math.round(group.groupDays)+'j'})</h4>
       ${p.dciGroupCovered?'<div style="padding:8px 12px;background:var(--cyan-bg);border:1px solid rgba(6,182,212,.3);border-radius:6px;margin:8px 0;font-size:12px;color:var(--cyan)">✓ DCI+dosage suffisamment couverte — pas besoin de réapprovisionner</div>':''}
       <table style="margin-top:8px"><thead><tr><th>Produit (en stock)</th><th>Stock</th><th>Conso/j</th><th>Jours</th></tr></thead><tbody>
-      ${group.products.sort((a,b)=>b.effectiveStock-a.effectiveStock).map(s=>`<tr style="${s.name===p.name?'font-weight:600;background:rgba(59,130,246,.05)':''}"><td>${s.name.substring(0,45)}</td><td>${fmt(s.effectiveStock)}</td><td>${s.dailyConsumption.toFixed(1)}</td><td>${s.daysRemaining>9e3?'∞':Math.round(s.daysRemaining)+'j'}</td></tr>`).join('')}
+      ${group.products.sort((a,b)=>b.effectiveStock-a.effectiveStock).map(s=>`<tr style="${s.name===p.name?'font-weight:600;background:rgba(59,130,246,.05)':''}"><td>${escTrunc(s.name,45)}</td><td>${fmt(s.effectiveStock)}</td><td>${s.dailyConsumption.toFixed(1)}</td><td>${s.daysRemaining>9e3?'∞':Math.round(s.daysRemaining)+'j'}</td></tr>`).join('')}
       </tbody></table>`;
       // V3: Show ALL generics from national DB (including those not in our inventory)
       const allGenerics=getGenericsForDCI(p.dci,p.matchedDosage);
@@ -1076,12 +1104,12 @@ function showDetail(name){
         const missing=allGenerics.filter(g=>!ourBrands.has(g.brand));
         if(missing.length>0){
           dciHTML+=`<h4 style="margin-top:12px;font-size:13px;color:var(--orange)">Génériques disponibles à commander (${missing.length} sur ${allGenerics.length} dans la base nationale):</h4>
-          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${missing.map(g=>`<span style="padding:4px 8px;background:var(--orange-bg);border-radius:4px;font-size:11px;color:var(--orange)">${g.brand} <span style="color:var(--text3)">(${g.labo||'?'})</span></span>`).join('')}</div>`;
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${missing.map(g=>`<span style="padding:4px 8px;background:var(--orange-bg);border-radius:4px;font-size:11px;color:var(--orange)">${escHTML(g.brand)} <span style="color:var(--text3)">(${escHTML(g.labo)||'?'})</span></span>`).join('')}</div>`;
         }
       }
     }
   }else if(p.dci&&p.dciCoverage&&p.dciCoverage.count>1){
-    dciHTML=`<h4 style="margin-top:16px;font-size:13px;color:var(--text2)">Même DCI: ${p.dci} (${p.dciCoverage.count} produits — non matchés dans la base nationale)</h4>`;
+    dciHTML=`<h4 style="margin-top:16px;font-size:13px;color:var(--text2)">Même DCI: ${escHTML(p.dci)} (${p.dciCoverage.count} produits — non matchés dans la base nationale)</h4>`;
   }
 
   document.getElementById('modalContent').innerHTML=`
@@ -1100,7 +1128,7 @@ function showDetail(name){
     <div style="margin-top:16px"><h4 style="font-size:13px;color:var(--text2);margin-bottom:8px">Fournisseurs & Prix (du + récent au + ancien)</h4>${supHTML}</div>
     ${dciHTML}
     ${p.expiredQty>0||p.nearExpiryQty>0?`<div style="margin-top:16px;padding:12px;background:var(--red-bg);border:1px solid rgba(239,68,68,.3);border-radius:6px;font-size:13px">⚠️ ${p.expiredQty>0?`<strong>${p.expiredQty} périmées.</strong> `:''}${p.nearExpiryQty>0?`<strong>${p.nearExpiryQty}</strong> expirent dans 3 mois.`:''}</div>`:''}
-    <div style="margin-top:12px;font-size:12px;color:var(--text3)">DCI: ${p.dci||'N/A'} | Labo: ${p.labo||'N/A'} | P.Achat: ${fmtDA(p.p_achat)} | P.Vente: ${fmtDA(p.p_vente)} | Marge: ${pct(p.margin)}${p.dciCode?' | Code: '+p.dciCode:''}</div>`;
+    <div style="margin-top:12px;font-size:12px;color:var(--text3)">DCI: ${escHTML(p.dci)||'N/A'} | Labo: ${escHTML(p.labo)||'N/A'} | P.Achat: ${fmtDA(p.p_achat)} | P.Vente: ${fmtDA(p.p_vente)} | Marge: ${pct(p.margin)}${p.dciCode?' | Code: '+escHTML(p.dciCode):''}</div>`;
 
   document.getElementById('productModal').classList.add('show');
   setTimeout(()=>{const ctx=document.getElementById('modalChart');if(ctx)new Chart(ctx,{type:'bar',data:{labels:mLabels,datasets:[{label:'Sorties',data:mExits,backgroundColor:'#3b82f6'},{label:'Entrées',data:mEntries,backgroundColor:'#22c55e44',borderColor:'#22c55e',borderWidth:1}]},options:{responsive:true,plugins:{legend:{labels:{color:'#94a3b8',font:{size:10}}}},scales:{x:{ticks:{color:'#94a3b8',font:{size:9}}},y:{ticks:{color:'#64748b'},grid:{color:'#1e293b'}}}}})},50);
@@ -1131,7 +1159,7 @@ function renderSuppliers(el){
       <div class="card purple"><div class="card-label">Économie Potentielle/mois</div><div class="card-value" style="font-size:18px">${fmtDA(savings)}</div></div>
     </div>
     <div class="tabs"><div class="tab ${supTab==='overview'?'active':''}" onclick="supTab='overview';renderSuppliers(document.getElementById('mainContent'))">Fournisseurs</div><div class="tab ${supTab==='compare'?'active':''}" onclick="supTab='compare';renderSuppliers(document.getElementById('mainContent'))">Comparaison Prix</div></div>
-    ${supTab==='overview'?`<div class="table-wrap"><div class="table-toolbar"><input placeholder="🔍 Rechercher..." value="${supFilter.search}" oninput="supFilter.search=this.value;renderSuppliers(document.getElementById('mainContent'))"></div><div class="table-scroll"><table><thead><tr><th>Fournisseur</th><th>Produits</th><th>Commandes</th><th>Dépense Totale</th></tr></thead><tbody>${sups.map(s=>`<tr><td><strong>${s.name}</strong></td><td>${Object.keys(s.products).length}</td><td>${s.orderCount}</td><td>${fmtDA(s.totalSpend)}</td></tr>`).join('')}</tbody></table></div></div>`
+    ${supTab==='overview'?`<div class="table-wrap"><div class="table-toolbar"><input placeholder="🔍 Rechercher..." value="${supFilter.search}" oninput="supFilter.search=this.value;renderSuppliers(document.getElementById('mainContent'))"></div><div class="table-scroll"><table><thead><tr><th>Fournisseur</th><th>Produits</th><th>Commandes</th><th>Dépense Totale</th></tr></thead><tbody>${sups.map(s=>`<tr><td><strong>${escHTML(s.name)}</strong></td><td>${Object.keys(s.products).length}</td><td>${s.orderCount}</td><td>${fmtDA(s.totalSpend)}</td></tr>`).join('')}</tbody></table></div></div>`
     :`<div class="table-wrap"><div class="table-toolbar"><input placeholder="🔍 Rechercher produit..." oninput="this.dataset.q=this.value;renderSuppliers(document.getElementById('mainContent'))"></div><div class="table-scroll"><table><thead><tr><th>Produit</th><th>Meilleur Prix</th><th>Date</th><th>Fournisseur</th><th>2ème Prix</th><th>Date</th><th>Fournisseur</th><th>Écart</th></tr></thead><tbody>${multiSup.slice(0,200).map(p=>{
       if(!p._supSummaries||p._supSummaries.length<2)return'';
       const b=p._supSummaries[0],s2=p._supSummaries[1];
@@ -1140,13 +1168,13 @@ function renderSuppliers(el){
       const bStale=b.latestDate&&(now-b.latestDate)>staleMs;
       const sStale=s2.latestDate&&(now-s2.latestDate)>staleMs;
       return`<tr onclick="showDetail('${escAttr(p.name)}')" style="cursor:pointer">
-        <td title="${p.name}">${p.name.substring(0,30)}</td>
+        <td title="${escHTML(p.name)}">${escTrunc(p.name,30)}</td>
         <td class="price-best ${bStale?'price-old':''}">${fmtDA(b.latestPrice)}</td>
         <td class="${bStale?'price-old':''}" style="font-size:11px">${b.latestDate?b.latestDate.toLocaleDateString('fr-FR'):'?'}${bStale?' ⚠':''}</td>
-        <td style="font-size:12px">${b.name}</td>
+        <td style="font-size:12px">${escHTML(b.name)}</td>
         <td class="price-second ${sStale?'price-old':''}">${fmtDA(s2.latestPrice)}</td>
         <td class="${sStale?'price-old':''}" style="font-size:11px">${s2.latestDate?s2.latestDate.toLocaleDateString('fr-FR'):'?'}${sStale?' ⚠':''}</td>
-        <td style="font-size:12px">${s2.name}</td>
+        <td style="font-size:12px">${escHTML(s2.name)}</td>
         <td style="color:${parseInt(spread)>20?'var(--red)':parseInt(spread)>10?'var(--orange)':'var(--text2)'}">+${spread}%</td>
       </tr>`;
     }).join('')}</tbody></table></div></div>`}`;
@@ -1200,16 +1228,16 @@ function renderPurchase(el){
         }
         return`<tr onclick="showDetail('${escAttr(p.name)}')" style="cursor:pointer${hasNoStock?' ;background:rgba(249,115,22,.05)':''}">
           <td>${p.riskScore}</td>
-          <td title="${p.name}${p._mergedNames&&p._mergedNames.length>1?' (fusionné: '+p._mergedNames.join(', ')+')':''}">${p.name.substring(0,28)}${p._mergedNames&&p._mergedNames.length>1?' <span style="color:var(--cyan);font-size:10px">×'+p._mergedNames.length+'</span>':''}</td>
-          <td style="font-size:11px;color:var(--text3)">${p.dci||'-'}</td>
-          <td style="font-size:11px">${p.matchedDosage||extractDosage(p.name)||'-'}</td>
+          <td title="${escHTML(p.name)}${p._mergedNames&&p._mergedNames.length>1?' (fusionné: '+p._mergedNames.map(n=>escHTML(n)).join(', ')+')':''}">${escTrunc(p.name,28)}${p._mergedNames&&p._mergedNames.length>1?' <span style="color:var(--cyan);font-size:10px">×'+p._mergedNames.length+'</span>':''}</td>
+          <td style="font-size:11px;color:var(--text3)">${escHTML(p.dci)||'-'}</td>
+          <td style="font-size:11px">${escHTML(p.matchedDosage)||extractDosage(p.name)||'-'}</td>
           <td><span class="abc-badge abc-${p.abc}">${p.abc}</span></td>
           <td style="font-weight:600;color:${p.effectiveStock<=0?'var(--red)':'var(--text)'}">${fmt(p.effectiveStock)}</td>
           <td style="color:${p.daysRemaining<=5?'var(--red)':p.daysRemaining<=15?'var(--orange)':'var(--text2)'}">${Math.round(p.daysRemaining)}j</td>
           <td><span class="alert-badge alert-${p.alertLevel}">${p.alertLabel}</span></td>
           <td style="font-weight:600">${fmt(p.suggestedPurchase)}</td>
           <td style="font-weight:600">${fmtDA(p.purchaseCost)}</td>
-          <td style="font-size:12px">${p.bestSupplier||'-'}${bDate?' <span style="font-size:10px;color:var(--text3)">'+bDate+'</span>':''}</td>
+          <td style="font-size:12px">${escHTML(p.bestSupplier)||'-'}${bDate?' <span style="font-size:10px;color:var(--text3)">'+bDate+'</span>':''}</td>
           <td>${genHTML}</td>
         </tr>`}).join('')}</tbody></table></div></div>`
     :renderBySupplier(ps)}`;
@@ -1226,10 +1254,10 @@ function showGenericSuggestions(productName){
     const group=DB._dciGroups[gKey];
     if(group)group.products.forEach(gp=>ourBrands.add(gp.matchedBrand));
   }
-  document.getElementById('modalTitle').textContent=`Génériques: ${p.dci} ${p.matchedDosage||''}`;
+  document.getElementById('modalTitle').textContent=`Génériques: ${escHTML(p.dci)} ${escHTML(p.matchedDosage)||''}`;
   document.getElementById('modalContent').innerHTML=`
     <div style="margin-bottom:12px;font-size:13px;color:var(--text2)">
-      ${generics.length} génériques enregistrés dans la base nationale pour <strong>${p.dci} ${p.matchedDosage||''}</strong> (${p.matchedForm||''})
+      ${generics.length} génériques enregistrés dans la base nationale pour <strong>${escHTML(p.dci)} ${escHTML(p.matchedDosage)||''}</strong> (${escHTML(p.matchedForm)||''})
     </div>
     <table><thead><tr><th>Marque</th><th>Laboratoire</th><th>Type</th><th>En Stock ?</th></tr></thead>
     <tbody>${generics.map(g=>{
@@ -1237,13 +1265,13 @@ function showGenericSuggestions(productName){
       // V3: Check if this generic is withdrawn
       const isWithdrawn=DB._withdrawnBrands&&(DB._withdrawnBrands.has(g.brand)||DB._withdrawnBrands.has(g.brand+'|'+normalizeDosage(g.dosage)));
       return`<tr style="${isWithdrawn?'opacity:.4;text-decoration:line-through':inStock?'background:rgba(59,130,246,.05)':''}">
-        <td><strong>${g.brand}</strong>${isWithdrawn?' ⛔':''}</td>
-        <td style="font-size:12px">${g.labo||'-'}</td>
-        <td style="font-size:11px">${g.type||'-'}</td>
+        <td><strong>${escHTML(g.brand)}</strong>${isWithdrawn?' ⛔':''}</td>
+        <td style="font-size:12px">${escHTML(g.labo)||'-'}</td>
+        <td style="font-size:11px">${escHTML(g.type)||'-'}</td>
         <td>${isWithdrawn?'<span style="color:#94a3b8">⛔ Retiré</span>':inStock?'<span style="color:var(--green)">✓ En stock</span>':'<span style="color:var(--orange)">✗ À commander</span>'}</td>
       </tr>`}).join('')}</tbody></table>
     <div style="margin-top:12px;font-size:12px;color:var(--text3)">
-      Produit d'origine: ${p.name} | Stock actuel: ${fmt(p.effectiveStock)} | Conso/jour: ${p.dailyConsumption.toFixed(1)}
+      Produit d'origine: ${escHTML(p.name)} | Stock actuel: ${fmt(p.effectiveStock)} | Conso/jour: ${p.dailyConsumption.toFixed(1)}
     </div>`;
   document.getElementById('productModal').classList.add('show');
 }
@@ -1253,9 +1281,9 @@ function renderBySupplier(ps){
   ps.forEach(p=>{const s=p.bestSupplier||'Sans fournisseur';if(!groups[s])groups[s]={products:[],total:0};groups[s].products.push(p);groups[s].total+=p.purchaseCost});
   return Object.entries(groups).sort((a,b)=>b[1].total-a[1].total).map(([sup,d])=>`
     <div class="table-wrap" style="margin-bottom:16px">
-      <div style="padding:12px 16px;display:flex;justify-content:space-between;border-bottom:1px solid var(--bg3)"><strong>${sup}</strong> — ${d.products.length} produits<span style="font-weight:600;color:var(--accent)">${fmtDA(d.total)}</span></div>
+      <div style="padding:12px 16px;display:flex;justify-content:space-between;border-bottom:1px solid var(--bg3)"><strong>${escHTML(sup)}</strong> — ${d.products.length} produits<span style="font-weight:600;color:var(--accent)">${fmtDA(d.total)}</span></div>
       <table><thead><tr><th>Produit</th><th>DCI</th><th>Stock</th><th>Qté</th><th>P.Achat</th><th>Date</th><th>Total</th></tr></thead><tbody>
-      ${d.products.map(p=>`<tr><td>${p.name.substring(0,30)}</td><td style="font-size:11px;color:var(--text3)">${p.dci||'-'}</td><td style="font-weight:600;color:${p.effectiveStock<=0?'var(--red)':'var(--text)'}">${fmt(p.effectiveStock)}</td><td>${fmt(p.suggestedPurchase)}</td><td>${fmtDA(p.bestPrice<Infinity?p.bestPrice:p.p_achat)}</td><td style="font-size:11px">${p.bestPriceDate?p.bestPriceDate.toLocaleDateString('fr-FR'):''}</td><td>${fmtDA(p.purchaseCost)}</td></tr>`).join('')}
+      ${d.products.map(p=>`<tr><td>${escTrunc(p.name,30)}</td><td style="font-size:11px;color:var(--text3)">${escHTML(p.dci)||'-'}</td><td style="font-weight:600;color:${p.effectiveStock<=0?'var(--red)':'var(--text)'}">${fmt(p.effectiveStock)}</td><td>${fmt(p.suggestedPurchase)}</td><td>${fmtDA(p.bestPrice<Infinity?p.bestPrice:p.p_achat)}</td><td style="font-size:11px">${p.bestPriceDate?p.bestPriceDate.toLocaleDateString('fr-FR'):''}</td><td>${fmtDA(p.purchaseCost)}</td></tr>`).join('')}
       </tbody></table></div>`).join('');
 }
 
@@ -1314,9 +1342,9 @@ function renderExpiry(el){
        :'<th>Produit</th><th>Stock</th><th>Valeur</th>'}
     </tr></thead><tbody>
       ${(expiryTab==='expired'?expired.sort((a,b)=>b.expiredQty*b.p_achat-a.expiredQty*a.p_achat):expiryTab==='near'?near.sort((a,b)=>b.nearExpiryQty*b.p_achat-a.nearExpiryQty*a.p_achat):dead.sort((a,b)=>b.stock*b.p_achat-a.stock*a.p_achat)).map(p=>{
-        if(expiryTab==='expired')return`<tr><td>${p.name.substring(0,40)}</td><td style="color:var(--red);font-weight:600">${fmt(p.expiredQty)}</td><td>${fmtDA(p.expiredQty*p.p_achat)}</td><td>${fmt(p.stock)}</td></tr>`;
-        if(expiryTab==='near'){const m=p.avgMonthlyExits>0?(p.nearExpiryQty/p.avgMonthlyExits).toFixed(1):'∞';const bad=m==='∞'||parseFloat(m)>3;return`<tr><td>${p.name.substring(0,40)}</td><td style="color:var(--orange);font-weight:600">${fmt(p.nearExpiryQty)}</td><td>${fmtDA(p.nearExpiryQty*p.p_achat)}</td><td>${p.avgMonthlyExits.toFixed(1)}</td><td style="color:${bad?'var(--red)':'var(--green)'}">${m}</td><td style="font-size:11px">${bad?'<span style="color:var(--red)">⚠ Ne pas réappro.</span>':'<span style="color:var(--green)">✓ Écoulement OK</span>'}</td></tr>`}
-        return`<tr><td>${p.name.substring(0,40)}</td><td>${fmt(p.stock)}</td><td>${fmtDA(p.stock*p.p_achat)}</td></tr>`;
+        if(expiryTab==='expired')return`<tr><td>${escTrunc(p.name,40)}</td><td style="color:var(--red);font-weight:600">${fmt(p.expiredQty)}</td><td>${fmtDA(p.expiredQty*p.p_achat)}</td><td>${fmt(p.stock)}</td></tr>`;
+        if(expiryTab==='near'){const m=p.avgMonthlyExits>0?(p.nearExpiryQty/p.avgMonthlyExits).toFixed(1):'∞';const bad=m==='∞'||parseFloat(m)>3;return`<tr><td>${escTrunc(p.name,40)}</td><td style="color:var(--orange);font-weight:600">${fmt(p.nearExpiryQty)}</td><td>${fmtDA(p.nearExpiryQty*p.p_achat)}</td><td>${p.avgMonthlyExits.toFixed(1)}</td><td style="color:${bad?'var(--red)':'var(--green)'}">${m}</td><td style="font-size:11px">${bad?'<span style="color:var(--red)">⚠ Ne pas réappro.</span>':'<span style="color:var(--green)">✓ Écoulement OK</span>'}</td></tr>`}
+        return`<tr><td>${escTrunc(p.name,40)}</td><td>${fmt(p.stock)}</td><td>${fmtDA(p.stock*p.p_achat)}</td></tr>`;
       }).join('')}
     </tbody></table></div></div>`;
 }
@@ -1332,7 +1360,7 @@ function filterDropdown(inputId,dropdownId,list,value){
   const q=(value||'').trim().toUpperCase();
   let matches=q.length<1?list.slice(0,15):list.filter(n=>n.toUpperCase().includes(q)).slice(0,15);
   if(matches.length===0){dd.style.display='none';return;}
-  dd.innerHTML=matches.map(n=>`<div class="dci-dropdown-item" onmousedown="selectDropdownItem('${inputId}','${dropdownId}','${escAttr(n)}')">${n}</div>`).join('');
+  dd.innerHTML=matches.map(n=>`<div class="dci-dropdown-item" onmousedown="selectDropdownItem('${inputId}','${dropdownId}','${escAttr(n)}')">${escHTML(n)}</div>`).join('');
   dd.style.display='block';
 }
 function selectDropdownItem(inputId,dropdownId,val){
@@ -1395,18 +1423,18 @@ function updateDCITable(){
     const inpId='dci_'+key;
     // All products get the DCI dropdown from Chifa AI database
     const dciList='DB.uniqueDCINames';
-    const ddField=`<div class="dci-autocomplete"><input id="${inpId}" value="${corr.dci||''}" placeholder="${p.dci||'Chercher DCI...'}" class="dci-input" autocomplete="off"
+    const ddField=`<div class="dci-autocomplete"><input id="${inpId}" value="${escAttr(corr.dci||'')}" placeholder="${escAttr(p.dci||'Chercher DCI...')}" class="dci-input" autocomplete="off"
       oninput="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
       onfocus="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
       onblur="setTimeout(()=>closeDropdown('${ddId}'),200)"${p.manualCategory?' disabled style="opacity:.4"':''}>
       <div id="${ddId}" class="dci-dropdown"></div></div>`;
     return`<tr>
-      <td title="${p.name}">${p.name.substring(0,35)}</td>
-      <td style="font-size:11px">${p.manualCategory?'<span class="cat-badge">'+p.manualCategory+'</span>':p.dci?p.dci:'<span style="color:var(--red)">—</span>'}</td>
-      <td style="font-size:11px">${p.matchedDosage||extractDosage(p.name)||'-'}</td>
+      <td title="${escHTML(p.name)}">${escTrunc(p.name,35)}</td>
+      <td style="font-size:11px">${p.manualCategory?'<span class="cat-badge">'+escHTML(p.manualCategory)+'</span>':p.dci?escHTML(p.dci):'<span style="color:var(--red)">—</span>'}</td>
+      <td style="font-size:11px">${escHTML(p.matchedDosage)||extractDosage(p.name)||'-'}</td>
       <td>${conf}</td>
       <td>${ddField}</td>
-      <td><input id="dos_${key}" value="${corr.dosage||''}" placeholder="${p.matchedDosage||extractDosage(p.name)||'opt.'}" style="background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:80px"></td>
+      <td><input id="dos_${key}" value="${escAttr(corr.dosage||'')}" placeholder="${escAttr(p.matchedDosage||extractDosage(p.name)||'opt.')}" style="background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:80px"></td>
       <td>${p.manualCategory==='Article'?`<span class="cat-badge">Article</span> <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:`<button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="saveDCICorrection('${escAttr(p.name)}')">💾</button> <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="markAsArticle('${escAttr(p.name)}')">🏷️ Article</button>${corr.dci||corr.category?` <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:''}`}</td>
     </tr>`}).join('');
 }
@@ -1420,7 +1448,7 @@ function saveDCICorrection(name){
   // DCI correction — input is always a DCI name (articles use markAsArticle button)
   if(dciVal)DB.manualDCI[name].dci=valUp;
   if(dosage)DB.manualDCI[name].dosage=san(dosage);
-  localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));
+  persistDCICorrections();
   const p=DB.products[name];
   if(p){
     if(dciVal){p.dci=valUp;p.category='medicament';p.manualCategory=null;}
@@ -1431,13 +1459,13 @@ function saveDCICorrection(name){
 }
 function deleteDCICorrection(name){
   delete DB.manualDCI[name];
-  localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));
+  persistDCICorrections();
   computeAll();updateBadges();
   renderDCIMatch(document.getElementById('mainContent'));
 }
 function markAsArticle(name){
   DB.manualDCI[name]={category:'Article'};
-  localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));
+  persistDCICorrections();
   const p=DB.products[name];
   if(p){p.manualCategory='Article';p.category='parapharm';p.manualDCI=true;}
   updateBadges();updateDCITable();
@@ -1455,9 +1483,9 @@ function importCorrections(file){
   r.onload=e=>{
     try{
       const data=JSON.parse(e.target.result);
-      if(data.manualDCI){DB.manualDCI={...DB.manualDCI,...data.manualDCI};localStorage.setItem('leghrib_pharmacy_dci_corrections',JSON.stringify(DB.manualDCI));}
-      if(data.manualCategories){DB.manualCategories=[...new Set([...(DB.manualCategories||[]),...data.manualCategories])];localStorage.setItem('leghrib_pharmacy_categories',JSON.stringify(DB.manualCategories));}
-      if(data.settings){Object.assign(DB.settings,data.settings);localStorage.setItem('leghrib_pharmacy_settings',JSON.stringify(DB.settings));}
+      if(data.manualDCI){DB.manualDCI={...DB.manualDCI,...data.manualDCI};persistDCICorrections();}
+      if(data.manualCategories){DB.manualCategories=[...new Set([...(DB.manualCategories||[]),...data.manualCategories])];persistCategories();}
+      if(data.settings){Object.assign(DB.settings,data.settings);persistSettings();}
       if(DB.loaded){computeAll();updateBadges();}
       renderDCIMatch(document.getElementById('mainContent'));
       alert('✓ '+Object.keys(data.manualDCI||{}).length+' corrections importées avec succès');
@@ -1567,11 +1595,11 @@ function updateClientsTable(){
   const tp=Math.max(1,Math.ceil(cs.length/ROWS));clientsPage=Math.min(clientsPage,tp-1);if(clientsPage<0)clientsPage=0;
   const page=cs.slice(clientsPage*ROWS,(clientsPage+1)*ROWS);
   const tbody=document.getElementById('clientsTableBody');
-  if(tbody)tbody.innerHTML=page.map(c=>`<tr style="cursor:pointer${c.flag.level==='critique'?';background:rgba(239,68,68,.04)':c.flag.level==='relancer'?';background:rgba(249,115,22,.03)':''}" onclick="if('${c.phone}')navigator.clipboard.writeText('${c.phone}')">
+  if(tbody)tbody.innerHTML=page.map(c=>`<tr style="cursor:pointer${c.flag.level==='critique'?';background:rgba(239,68,68,.04)':c.flag.level==='relancer'?';background:rgba(249,115,22,.03)':''}" onclick="if('${escAttr(c.phone)}')navigator.clipboard.writeText('${escAttr(c.phone)}')">
     <td><span class="alert-badge ${c.flag.cls}">${c.flag.label}</span></td>
-    <td title="${c.name}">${c.name.substring(0,30)}${c.name.length>30?'..':''}</td>
-    <td style="font-size:11px;color:var(--text3)">${c.type}</td>
-    <td style="font-weight:${c.phone?'600':'400'};color:${c.phone?'var(--accent)':'var(--text3)'}">${c.phone||'—'}</td>
+    <td title="${escHTML(c.name)}">${escTrunc(c.name,30)}</td>
+    <td style="font-size:11px;color:var(--text3)">${escHTML(c.type)}</td>
+    <td style="font-weight:${c.phone?'600':'400'};color:${c.phone?'var(--accent)':'var(--text3)'}">${escHTML(c.phone)||'—'}</td>
     <td style="font-weight:600">${fmtDA(c.unpaid)}</td>
     <td style="color:${c.daysSale&&c.daysSale>120?'var(--red)':c.daysSale&&c.daysSale>60?'var(--orange)':'var(--text2)'}">${c.lastSale?c.lastSale.toLocaleDateString('fr-FR'):'—'}</td>
     <td style="color:${c.daysPay&&c.daysPay>120?'var(--red)':c.daysPay&&c.daysPay>60?'var(--orange)':'var(--text2)'}">${c.lastPayment?c.lastPayment.toLocaleDateString('fr-FR'):'—'}</td>
@@ -1610,15 +1638,15 @@ function renderSettings(el){
     <h2 class="page-title">Paramètres</h2>
     <div class="settings-grid">
       <div class="setting-group"><h3>🔔 Seuils d'Alerte (jours)</h3>
-        ${[['alert_rupture','Alerte rupture'],['alert_securite','Stock sécurité'],['stock_cible','Stock cible'],['surstock','Seuil surstock'],['prix_perime_mois','Prix périmé (mois)']].map(([k,l])=>`<div class="setting-row"><label>${l}</label><input type="number" value="${s[k]}" onchange="DB.settings['${k}']=Number(this.value);localStorage.setItem('leghrib_pharmacy_settings',JSON.stringify(DB.settings))"></div>`).join('')}
+        ${[['alert_rupture','Alerte rupture'],['alert_securite','Stock sécurité'],['stock_cible','Stock cible'],['surstock','Seuil surstock'],['prix_perime_mois','Prix périmé (mois)']].map(([k,l])=>`<div class="setting-row"><label>${l}</label><input type="number" value="${s[k]}" onchange="DB.settings['${k}']=Number(this.value);persistSettings()"></div>`).join('')}
       </div>
       <div class="setting-group"><h3>📈 Objectifs Croissance (%)</h3>
-        <div class="setting-row"><label>Global</label><input type="number" value="${s.growth_global}" onchange="DB.settings.growth_global=Number(this.value);localStorage.setItem('leghrib_pharmacy_settings',JSON.stringify(DB.settings))">%</div>
-        ${['medicament','parapharm','dispositif','autre'].map(c=>`<div class="setting-row"><label>${{medicament:'Médicaments',parapharm:'Parapharmacie',dispositif:'Dispositifs',autre:'Autre'}[c]}</label><input type="number" value="${s.growth_categories[c]}" onchange="DB.settings.growth_categories['${c}']=Number(this.value);localStorage.setItem('leghrib_pharmacy_settings',JSON.stringify(DB.settings))">%</div>`).join('')}
+        <div class="setting-row"><label>Global</label><input type="number" value="${s.growth_global}" onchange="DB.settings.growth_global=Number(this.value);persistSettings()">%</div>
+        ${['medicament','parapharm','dispositif','autre'].map(c=>`<div class="setting-row"><label>${{medicament:'Médicaments',parapharm:'Parapharmacie',dispositif:'Dispositifs',autre:'Autre'}[c]}</label><input type="number" value="${s.growth_categories[c]}" onchange="DB.settings.growth_categories['${c}']=Number(this.value);persistSettings()">%</div>`).join('')}
       </div>
       <div class="setting-group"><h3>📦 Stock Cible par Classification (mois)</h3>
         <p style="font-size:11px;color:var(--text3);margin-bottom:12px">Nombre de mois de stock cible selon ABC/XYZ. A=forte valeur, C=faible. X=stable, Z=erratique.</p>
-        ${['AX','AY','AZ','BX','BY','BZ','CX','CY','CZ'].map(k=>`<div class="setting-row"><label>${k}</label><input type="number" step="0.5" min="0.5" max="6" value="${s.targetMonths?s.targetMonths[k]:{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1}[k]}" onchange="if(!DB.settings.targetMonths)DB.settings.targetMonths={AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1};DB.settings.targetMonths['${k}']=Number(this.value);localStorage.setItem('leghrib_pharmacy_settings',JSON.stringify(DB.settings))"> mois</div>`).join('')}
+        ${['AX','AY','AZ','BX','BY','BZ','CX','CY','CZ'].map(k=>`<div class="setting-row"><label>${k}</label><input type="number" step="0.5" min="0.5" max="6" value="${s.targetMonths?s.targetMonths[k]:{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1}[k]}" onchange="if(!DB.settings.targetMonths)DB.settings.targetMonths={AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1};DB.settings.targetMonths['${k}']=Number(this.value);persistSettings()"> mois</div>`).join('')}
       </div>
       <div class="setting-group"><h3>🔄 Actions</h3>
         <div style="display:flex;gap:12px;flex-wrap:wrap">
@@ -1644,8 +1672,106 @@ function exportReport(){
   XLSX.writeFile(wb,`LeghribPharmacy_Rapport_${new Date().toISOString().slice(0,10)}.xlsx`);
 }
 
+// ==================== INDEXEDDB PERSISTENCE ====================
+const IDB_NAME='leghrib_pharmacy';
+const IDB_VERSION=1;
+const IDB_STORE='appdata';
+
+function openIDB(){
+  return new Promise((resolve,reject)=>{
+    const req=indexedDB.open(IDB_NAME,IDB_VERSION);
+    req.onupgradeneeded=e=>{
+      const db=e.target.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)){
+        db.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess=e=>resolve(e.target.result);
+    req.onerror=e=>{console.warn('IndexedDB unavailable, falling back to localStorage');reject(e)};
+  });
+}
+
+function idbGet(key){
+  return openIDB().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(IDB_STORE,'readonly');
+    const req=tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error);
+  }));
+}
+
+function idbSet(key,value){
+  return openIDB().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(IDB_STORE,'readwrite');
+    tx.objectStore(IDB_STORE).put(value,key);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  }));
+}
+
+function idbDelete(key){
+  return openIDB().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(IDB_STORE,'readwrite');
+    tx.objectStore(IDB_STORE).delete(key);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  }));
+}
+
+function idbClear(){
+  return openIDB().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(IDB_STORE,'readwrite');
+    tx.objectStore(IDB_STORE).clear();
+    tx.oncomplete=()=>resolve();
+    tx.onerror=()=>reject(tx.error);
+  }));
+}
+
+// Save to both localStorage (fast sync fallback) and IndexedDB (robust)
+function persistSettings(){
+  const data=JSON.stringify(DB.settings);
+  localStorage.setItem('leghrib_pharmacy_settings',data);
+  idbSet('settings',DB.settings).catch(()=>{});
+}
+function persistDCICorrections(){
+  const data=JSON.stringify(DB.manualDCI);
+  localStorage.setItem('leghrib_pharmacy_dci_corrections',data);
+  idbSet('manualDCI',DB.manualDCI).catch(()=>{});
+}
+function persistCategories(){
+  const data=JSON.stringify(DB.manualCategories);
+  localStorage.setItem('leghrib_pharmacy_categories',data);
+  idbSet('manualCategories',DB.manualCategories).catch(()=>{});
+}
+
 // ==================== INIT ====================
-try{const s=localStorage.getItem('leghrib_pharmacy_settings');if(s){const parsed=JSON.parse(s);Object.assign(DB.settings,parsed);if(parsed.targetMonths)DB.settings.targetMonths={...{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1},...parsed.targetMonths};}}catch(e){}
-try{const mc=localStorage.getItem('leghrib_pharmacy_dci_corrections');if(mc)DB.manualDCI=JSON.parse(mc)}catch(e){}
-try{const cats=localStorage.getItem('leghrib_pharmacy_categories');if(cats)DB.manualCategories=JSON.parse(cats)}catch(e){}
-showPage('import');
+async function initApp(){
+  // Load from IndexedDB first, fall back to localStorage
+  try{
+    const [idbSettings,idbDCI,idbCats]=await Promise.all([
+      idbGet('settings').catch(()=>null),
+      idbGet('manualDCI').catch(()=>null),
+      idbGet('manualCategories').catch(()=>null)
+    ]);
+    // Settings
+    const settings=idbSettings||(() => {try{const s=localStorage.getItem('leghrib_pharmacy_settings');return s?JSON.parse(s):null}catch(e){return null}})();
+    if(settings){Object.assign(DB.settings,settings);if(settings.targetMonths)DB.settings.targetMonths={...{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1},...settings.targetMonths};}
+    // DCI corrections
+    const dci=idbDCI||(()=>{try{const mc=localStorage.getItem('leghrib_pharmacy_dci_corrections');return mc?JSON.parse(mc):null}catch(e){return null}})();
+    if(dci)DB.manualDCI=dci;
+    // Categories
+    const cats=idbCats||(()=>{try{const c=localStorage.getItem('leghrib_pharmacy_categories');return c?JSON.parse(c):null}catch(e){return null}})();
+    if(cats)DB.manualCategories=cats;
+    // Migrate localStorage data to IndexedDB if it wasn't there
+    if(!idbSettings&&settings)idbSet('settings',settings).catch(()=>{});
+    if(!idbDCI&&dci)idbSet('manualDCI',dci).catch(()=>{});
+    if(!idbCats&&cats)idbSet('manualCategories',cats).catch(()=>{});
+  }catch(e){
+    // Pure localStorage fallback
+    try{const s=localStorage.getItem('leghrib_pharmacy_settings');if(s){const parsed=JSON.parse(s);Object.assign(DB.settings,parsed);if(parsed.targetMonths)DB.settings.targetMonths={...{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1},...parsed.targetMonths};}}catch(e2){}
+    try{const mc=localStorage.getItem('leghrib_pharmacy_dci_corrections');if(mc)DB.manualDCI=JSON.parse(mc)}catch(e2){}
+    try{const cats=localStorage.getItem('leghrib_pharmacy_categories');if(cats)DB.manualCategories=JSON.parse(cats)}catch(e2){}
+  }
+  showPage('import');
+}
+initApp();

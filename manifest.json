@@ -1,0 +1,27 @@
+{
+  "name": "Leghrib Pharmacy — Gestion Prévisionnelle des Stocks",
+  "short_name": "Leghrib Pharmacy",
+  "description": "Outil de gestion et de prévision des stocks pour la Pharmacie Leghrib",
+  "start_url": "PharmaPlanV4.html",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "orientation": "landscape-primary",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

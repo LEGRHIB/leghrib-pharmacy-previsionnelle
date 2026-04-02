@@ -4,14 +4,28 @@ Thanks for helping improve this project.
 
 ## Getting started
 
-1. Open pharmplanV3.html in a browser.
+1. Open `PharmaPlanV4.html` in a browser.
 2. Use sample XLSX files or your own test data.
+3. Run `tests.html` in a browser to verify core algorithms pass.
 
 ## Code style
 
-- Keep JavaScript in app.js and CSS in styles.css.
+- Keep JavaScript in `app.js` and CSS in `styles.css`.
 - Prefer small, focused functions.
 - Add comments only for non-obvious logic.
+- Use `escHTML()` for any user-supplied data inserted via innerHTML.
+- Use `escTrunc()` for truncated product/client names in tables.
+
+## Testing
+
+- Open `tests.html` in a browser to run the unit test suite.
+- If you change parsing logic (dosage extraction, brand extraction, DCI matching), add corresponding test cases in `tests.js`.
+- Verify all tests pass before submitting changes.
+
+## Persistence
+
+- Settings and corrections are saved to both localStorage (fast fallback) and IndexedDB (robust).
+- Use `persistSettings()`, `persistDCICorrections()`, and `persistCategories()` instead of raw `localStorage.setItem()`.
 
 ## Suggestions
 
