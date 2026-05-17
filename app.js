@@ -1,17 +1,26 @@
 // ==================== GLOBAL STATE ====================
+// V5 default targetMonths (F-8): Z gets MORE stock than X (volatility = safety buffer)
+const DEFAULT_TARGET_MONTHS = {AX:2,AY:2.5,AZ:3,BX:1.5,BY:2,BZ:2.5,CX:1,CY:1.5,CZ:2};
 const DB = {
   rotation: [], monthly: {}, nomenclature: [], nationalDCI: [], clients: [],
   products: {}, suppliers: {}, dciGroups: {},
   settings: {
     alert_rupture:5, alert_securite:15, stock_cible:90, surstock:120, prix_perime_mois:3,
     growth_global:0, growth_categories:{medicament:0,parapharm:0,dispositif:0,autre:0},
-    targetMonths:{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1},
+    targetMonths:{...DEFAULT_TARGET_MONTHS},
+    lead_time_default:7,           // F-6: default supplier lead time (days)
+    supplierLeadTimes:{},          // F-6: per-supplier override (name -> days)
+    sparse_demand_threshold:5,     // F-2: ≤N active months out of 13 → sparse path
+    new_product_threshold:6,       // F-9: <N months history → new-product fallback
+    reorder_alert_factor:0.8,      // F-4: alert when stock < target × factor (legacy fallback)
   },
   manualDCI:{}, // V4: manual DCI corrections + category tags
   manualCategories:[], // V4.1: user-defined custom categories
   uniqueDCINames:[], // V4.1: sorted canonical DCI names for dropdown
   importStatus: {rotation:false, monthly:0, nomenclature:false, chifaDCI:false, clients:false},
-  loaded: false
+  loaded: false,
+  lastComputedAt: null,            // U-8: timestamp of last computeAll
+  uiFilters: {},                   // U-6: persisted UI filter state
 };
 
 // ==================== UTILITIES ====================
@@ -19,7 +28,23 @@ const fmt = (n,d=0) => n==null||isNaN(n)?'-':Number(n).toLocaleString('fr-FR',{m
 const fmtDA = n => n==null||isNaN(n)||n===0?'-':fmt(n)+' DA';
 const pct = n => n==null||isNaN(n)?'-':(n*100).toFixed(1)+'%';
 const san = s => s?String(s).trim().toUpperCase():'';
-const escAttr = s => s.replace(/'/g,"\\'").replace(/"/g,'&quot;');
+const escAttr = s => s.replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+
+// U-8: human-readable "last computed" stamp for page subtitles
+function fmtLastCompute(){
+  if(!DB.lastComputedAt)return '';
+  const d=DB.lastComputedAt instanceof Date?DB.lastComputedAt:new Date(DB.lastComputedAt);
+  const mins=Math.floor((Date.now()-d.getTime())/60000);
+  if(mins<1)return 'à l\'instant';
+  if(mins<60)return `il y a ${mins} min`;
+  const hrs=Math.floor(mins/60);
+  if(hrs<24)return `il y a ${hrs}h`;
+  return d.toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+}
+function lastComputeBadge(){
+  if(!DB.lastComputedAt)return '';
+  return ` <span style="font-size:11px;color:var(--text3);margin-left:8px">⏱ Dernier calcul: ${fmtLastCompute()}</span>`;
+}
 
 // HTML escaping to prevent XSS from user-supplied data (product names, supplier names, etc.)
 function escHTML(s){
@@ -665,9 +690,20 @@ function computeAll(){
   }
 
   // Step 5: Compute per-product metrics
+  // V5 restructure: split into 3 passes so ABC is known BEFORE target stock (F-1 fix)
+  //   Pass A — expiry, seasonality, demand model, XYZ, suppliers, revenue
+  //   Pass B — ABC classification (uses revenue from Pass A)
+  //   Pass C — target stock + suggested purchase + reorder point (uses ABC from Pass B)
   const threeMonths=new Date(now.getTime()+90*864e5);
   const allExitsValues=[];
+  const curMonth=now.getMonth()+1;
+  const sparseThreshold=DB.settings.sparse_demand_threshold||5;
+  const newProductThreshold=DB.settings.new_product_threshold||6;
+  const leadTimeDefault=DB.settings.lead_time_default||7;
+  const supplierLeadTimes=DB.settings.supplierLeadTimes||{};
+  const stalenessMs=(DB.settings.prix_perime_mois||3)*30*864e5;
 
+  // ---------------- PASS A ----------------
   Object.values(products).forEach(p=>{
     // Expiry from lots
     let expired=0,nearExp=0;
@@ -679,84 +715,138 @@ function computeAll(){
     p.expiredQty=expired;p.nearExpiryQty=nearExp;
     p.effectiveStock=Math.max(0,p.stock-expired);
 
-    // Seasonality
-    const monthValues={};
+    // F-3: Detect stockout months (exits=0 in a month that had entries) — exclude from seasonality
+    // Heuristic: if exits=0 AND (entries>0 in that month OR active months on both sides), treat as stockout, not low demand
+    const activeMonthsSet=new Set(Object.keys(p.monthlyExits).filter(mk=>p.monthlyExits[mk]>0));
+    const entryMonthsSet=new Set(Object.keys(p.monthlyEntries).filter(mk=>p.monthlyEntries[mk]>0));
+    const stockoutMonths=new Set();
+    sortedMonths.forEach((mk,i)=>{
+      const exits=p.monthlyExits[mk]||0;
+      if(exits>0)return;
+      // Likely stockout if entries arrived but nothing went out
+      if(entryMonthsSet.has(mk)){stockoutMonths.add(mk);return;}
+      // Or if surrounded by active months
+      const prev=sortedMonths.slice(0,i).reverse().find(m=>activeMonthsSet.has(m));
+      const next=sortedMonths.slice(i+1).find(m=>activeMonthsSet.has(m));
+      if(prev&&next)stockoutMonths.add(mk);
+    });
+    p._stockoutMonths=stockoutMonths;
+
+    // Build per-calendar-month values (excluding stockout months)
+    const monthValues={}; // calendar month 1..12 -> [qty,...]
     Object.entries(p.monthlyExits).forEach(([mk,qty])=>{
+      if(stockoutMonths.has(mk))return;
       const m=parseInt(mk.split('-')[1]);
       if(!monthValues[m])monthValues[m]=[];
       monthValues[m].push(qty);
     });
+
+    // F-2 + F-9: Decide demand model — sparse, new-product, or seasonal
+    const activeMonthsCount=activeMonthsSet.size;
+    const historyMonthsCount=sortedMonths.filter(mk=>{
+      // months from product's first activity onward
+      if(!p._firstActiveMonth){
+        const first=sortedMonths.find(m=>activeMonthsSet.has(m));
+        p._firstActiveMonth=first||null;
+      }
+      return p._firstActiveMonth?mk>=p._firstActiveMonth:false;
+    }).length;
+    p._activeMonthsCount=activeMonthsCount;
+    p._historyMonthsCount=historyMonthsCount;
+
+    let useSparsePath=false, useNewProductPath=false;
+    if(activeMonthsCount>0&&activeMonthsCount<=sparseThreshold)useSparsePath=true;
+    if(activeMonthsCount>0&&historyMonthsCount<newProductThreshold&&!useSparsePath)useNewProductPath=true;
+
+    // Seasonality: per-month avg / overall avg (with stockout exclusion + F-2 sparse denominator)
     const monthAvgs=[];
     for(let m=1;m<=12;m++){
       const vals=monthValues[m]||[0];
       const avg=vals.reduce((a,b)=>a+b,0)/vals.length;
       p.seasonalIndex[m]=avg;monthAvgs.push(avg);
     }
-    const overallAvg=monthAvgs.reduce((a,b)=>a+b,0)/12;
+    // F-2: denominator = months with data (not always /12); fallback to /12 only if all months populated
+    const monthsWithData=monthAvgs.filter(v=>v>0).length;
+    const denom=monthsWithData>0?monthsWithData:12;
+    const overallAvg=monthAvgs.reduce((a,b)=>a+b,0)/denom;
     for(let m=1;m<=12;m++)p.seasonalIndex[m]=overallAvg>0?p.seasonalIndex[m]/overallAvg:1;
     p.avgMonthlyExits=overallAvg;p.avgDailyExits=overallAvg/30;
+    p._useSparsePath=useSparsePath;p._useNewProductPath=useNewProductPath;
+    p._monthsWithData=monthsWithData;
 
     const totalFromMonthly=Object.values(p.monthlyExits).reduce((a,b)=>a+b,0);
     if(totalFromMonthly>0)p.yearlyExits=Math.max(p.yearlyExits,totalFromMonthly);
 
-    // Trend
-    const recent=sortedMonths.slice(-3).map(mk=>p.monthlyExits[mk]||0);
-    const recentAvg=recent.reduce((a,b)=>a+b,0)/3;
-    p.trend=overallAvg>0?Math.max(0.3,Math.min(3,recentAvg/overallAvg)):1;
+    // F-7: Trend — prefer year-over-year when we have 13+ months, else fall back to recent/overall
+    let trend=1;
+    if(sortedMonths.length>=13){
+      // Build YoY ratios for every month that has both this-year and last-year data, excluding stockout months
+      const monthByMK={};
+      sortedMonths.forEach(mk=>{
+        if(stockoutMonths.has(mk))return;
+        const qty=p.monthlyExits[mk]||0;
+        const [yStr,mStr]=mk.split('-');
+        const y=parseInt(yStr),m=parseInt(mStr);
+        monthByMK[mk]={y,m,qty};
+      });
+      const ratios=[];
+      Object.values(monthByMK).forEach(({y,m,qty})=>{
+        const prevMK=`${y-1}-${String(m).padStart(2,'0')}`;
+        const prev=monthByMK[prevMK];
+        if(prev&&prev.qty>0&&qty>0)ratios.push(qty/prev.qty);
+      });
+      if(ratios.length>=2){
+        const yoy=ratios.reduce((a,b)=>a+b,0)/ratios.length;
+        trend=Math.max(0.3,Math.min(3,yoy));
+      }
+    }
+    if(trend===1){
+      // Fallback: classic 3-month / overall
+      const recent=sortedMonths.slice(-3).map(mk=>p.monthlyExits[mk]||0);
+      const recentAvg=recent.reduce((a,b)=>a+b,0)/3;
+      trend=overallAvg>0?Math.max(0.3,Math.min(3,recentAvg/overallAvg)):1;
+    }
+    p.trend=trend;
 
-    // XYZ
-    const mVals=Object.values(p.monthlyExits);
-    if(mVals.length>=3){
-      const mean=mVals.reduce((a,b)=>a+b,0)/mVals.length;
-      const variance=mVals.reduce((a,b)=>a+(b-mean)**2,0)/mVals.length;
+    // XYZ (uses only NON-stockout months so volatility isn't inflated by stockouts)
+    const cleanMvals=Object.entries(p.monthlyExits).filter(([mk])=>!stockoutMonths.has(mk)).map(([,v])=>v);
+    if(cleanMvals.length>=3){
+      const mean=cleanMvals.reduce((a,b)=>a+b,0)/cleanMvals.length;
+      const variance=cleanMvals.reduce((a,b)=>a+(b-mean)**2,0)/cleanMvals.length;
       p.cv=mean>0?Math.sqrt(variance)/mean:999;
     }
     p.xyz=p.cv<0.3?'X':p.cv<0.6?'Y':'Z';
 
-    // Consumption & days remaining
-    const curMonth=now.getMonth()+1;
-    const seasonalRate=p.avgDailyExits*(p.seasonalIndex[curMonth]||1);
-    p.dailyConsumption=seasonalRate>0?seasonalRate:p.yearlyExits/365;
-    p.daysRemaining=p.dailyConsumption>0?p.effectiveStock/p.dailyConsumption:9999;
-
-    // V4: ABC/XYZ-modulated target months (was flat 3 months in V3)
-    const _tm={'AX':3,'AY':2.5,'AZ':2,'BX':2.5,'BY':2,'BZ':1.5,'CX':2,'CY':1.5,'CZ':1};
-    const tMonths=DB.settings.targetMonths&&DB.settings.targetMonths[p.abc+p.xyz]!=null?DB.settings.targetMonths[p.abc+p.xyz]:(_tm[p.abc+p.xyz]||2);
-    const growthMult=1+(DB.settings.growth_categories[p.category]||DB.settings.growth_global)/100;
-    let target=0;
-    const fullM=Math.floor(tMonths);
-    for(let i=0;i<fullM;i++){const fm=((curMonth-1+i)%12)+1;target+=p.avgMonthlyExits*(p.seasonalIndex[fm]||1)*p.trend*growthMult;}
-    const partFrac=tMonths-fullM;
-    if(partFrac>0){const fm=((curMonth-1+fullM)%12)+1;target+=p.avgMonthlyExits*(p.seasonalIndex[fm]||1)*p.trend*growthMult*partFrac;}
-    p.targetStock=Math.ceil(target);p._targetMonths=tMonths;
-    // V3: Withdrawn products — NEVER suggest purchasing them
-    if(p.withdrawn){
-      p.suggestedPurchase=0;
-      p.purchaseCost=0;
+    // F-9: daily consumption — use per-active-month average for sparse/new products
+    if(useSparsePath||useNewProductPath){
+      const activeAvg=activeMonthsCount>0?totalFromMonthly/activeMonthsCount:0;
+      p.dailyConsumption=activeAvg/30;
     }else{
-      p.suggestedPurchase=Math.max(0,p.targetStock-p.effectiveStock);
-      p.purchaseCost=p.suggestedPurchase*p.p_achat;
+      const seasonalRate=p.avgDailyExits*(p.seasonalIndex[curMonth]||1);
+      p.dailyConsumption=seasonalRate>0?seasonalRate:(p.avgDailyExits>0?p.avgDailyExits:p.yearlyExits/365);
     }
+    p.daysRemaining=p.dailyConsumption>0?p.effectiveStock/p.dailyConsumption:9999;
 
     // Revenue & margin
     p.yearlyRevenue=p.yearlyExits*p.p_vente;
     p.margin=p.p_achat>0?(p.p_vente-p.p_achat)/p.p_achat:0;
 
-    // Supplier summary with latest prices
+    // U-5: Composite supplier score (latest price × (1 + months_since_last × 0.1))
     p.supplierCount=Object.keys(p.suppliers).length;
     p.bestSupplier=null;p.bestPrice=Infinity;p.secondBestSupplier=null;p.secondBestPrice=Infinity;
     const supSummaries=[];
     Object.entries(p.suppliers).forEach(([sup,data])=>{
-      // Sort by date descending to get latest
       const sorted=data.entries.filter(e=>e.price>0).sort((a,b)=>(b.date||0)-(a.date||0));
       const latest=sorted[0];
       if(!latest)return;
       data.latestPrice=latest.price;data.latestDate=latest.date;
       data.avgPrice=data.entries.reduce((a,e)=>a+e.price,0)/data.entries.length;
-      supSummaries.push({name:sup,latestPrice:latest.price,latestDate:latest.date,totalQty:data.totalQty,entries:data.entries.length});
+      const monthsSince=latest.date?Math.max(0,(now-latest.date)/864e5/30):24;
+      const score=latest.price*(1+monthsSince*0.1);
+      supSummaries.push({name:sup,latestPrice:latest.price,latestDate:latest.date,
+        totalQty:data.totalQty,entries:data.entries.length,score,monthsSince});
     });
-    // Sort by latest price
-    supSummaries.sort((a,b)=>a.latestPrice-b.latestPrice);
+    supSummaries.sort((a,b)=>a.score-b.score); // composite score (lower = better)
     if(supSummaries[0]){p.bestSupplier=supSummaries[0].name;p.bestPrice=supSummaries[0].latestPrice;p.bestPriceDate=supSummaries[0].latestDate;}
     if(supSummaries[1]){p.secondBestSupplier=supSummaries[1].name;p.secondBestPrice=supSummaries[1].latestPrice;p.secondBestPriceDate=supSummaries[1].latestDate;}
     p._supSummaries=supSummaries;
@@ -764,11 +854,69 @@ function computeAll(){
     allExitsValues.push({name:p.name,revenue:p.yearlyRevenue});
   });
 
-  // ABC classification
+  // ---------------- PASS B: ABC (F-1 fix — must run BEFORE target stock) ----------------
   allExitsValues.sort((a,b)=>b.revenue-a.revenue);
   const totalRev=allExitsValues.reduce((a,b)=>a+b.revenue,0);
   let cum=0;
-  allExitsValues.forEach(item=>{cum+=item.revenue;if(products[item.name])products[item.name].abc=cum/totalRev<=0.8?'A':cum/totalRev<=0.95?'B':'C';});
+  allExitsValues.forEach(item=>{
+    cum+=item.revenue;
+    if(products[item.name]){
+      const r=totalRev>0?cum/totalRev:1;
+      products[item.name].abc=r<=0.8?'A':r<=0.95?'B':'C';
+    }
+  });
+
+  // ---------------- PASS C: target stock + reorder point + suggested purchase ----------------
+  Object.values(products).forEach(p=>{
+    const tMonths=DB.settings.targetMonths&&DB.settings.targetMonths[p.abc+p.xyz]!=null
+      ?DB.settings.targetMonths[p.abc+p.xyz]
+      :(DEFAULT_TARGET_MONTHS[p.abc+p.xyz]||2);
+    const growthMult=1+(DB.settings.growth_categories[p.category]||DB.settings.growth_global)/100;
+
+    let target=0;
+    if(p._useSparsePath||p._useNewProductPath){
+      // F-2/F-9: target = active-month average × target months × growth
+      const activeAvg=p._activeMonthsCount>0?p.yearlyExits/p._activeMonthsCount:0;
+      target=activeAvg*tMonths*growthMult;
+    }else{
+      const fullM=Math.floor(tMonths);
+      for(let i=0;i<fullM;i++){
+        const fm=((curMonth-1+i)%12)+1;
+        target+=p.avgMonthlyExits*(p.seasonalIndex[fm]||1)*p.trend*growthMult;
+      }
+      const partFrac=tMonths-fullM;
+      if(partFrac>0){
+        const fm=((curMonth-1+fullM)%12)+1;
+        target+=p.avgMonthlyExits*(p.seasonalIndex[fm]||1)*p.trend*growthMult*partFrac;
+      }
+    }
+    p.targetStock=Math.ceil(target);p._targetMonths=tMonths;
+
+    // F-6: Lead time → reorder point
+    const supLT=p.bestSupplier&&supplierLeadTimes[p.bestSupplier]!=null?supplierLeadTimes[p.bestSupplier]:leadTimeDefault;
+    p.leadTime=supLT;
+    // Safety stock = cv × dailyConsumption × leadTime (Z products get bigger buffer naturally)
+    const safetyFactor=p.cv<10?Math.min(2,p.cv):0.3;
+    p.safetyStock=Math.ceil(safetyFactor*p.dailyConsumption*supLT);
+    p.reorderPoint=Math.ceil(p.dailyConsumption*supLT+p.safetyStock);
+
+    // V3: Withdrawn products — NEVER suggest purchasing them
+    if(p.withdrawn){
+      p.suggestedPurchase=0;p.purchaseCost=0;
+    }else{
+      p.suggestedPurchase=Math.max(0,p.targetStock-p.effectiveStock);
+      p.purchaseCost=p.suggestedPurchase*p.p_achat;
+    }
+
+    // F-5: If near-expiry stock can cover more than 1 month of demand, defer reorder
+    p.deferForExpiry=false;
+    if(!p.withdrawn&&p.nearExpiryQty>0&&p.avgMonthlyExits>0&&p.nearExpiryQty>p.avgMonthlyExits){
+      // We'd have to write off the near-expiry batch first — don't suggest buying more
+      p.deferForExpiry=true;
+      p._suggestedPurchaseRaw=p.suggestedPurchase;
+      p.suggestedPurchase=0;p.purchaseCost=0;
+    }
+  });
 
   // Step 6: V3 — DCI group coverage (STRICT by DCI name + normalized dosage)
   // Groups are ONLY products with same DCI molecule AND same dosage
@@ -840,19 +988,25 @@ function computeAll(){
   });
 
   // Alert levels
+  // F-4: Added 'reorder' level — fires between '15j' and 'OK' when stock hits the reorder point
+  //      OR when effectiveStock < targetStock × reorder_alert_factor (catches under-stock not flagged by days alone)
   Object.values(products).forEach(p=>{
+    const reorderFactor=DB.settings.reorder_alert_factor||0.8;
+    const belowReorderPoint=p.reorderPoint>0&&p.effectiveStock<=p.reorderPoint;
+    const belowTarget=p.targetStock>0&&p.effectiveStock<p.targetStock*reorderFactor;
     // V3: Withdrawn products get special alert level
     if(p.withdrawn){p.alertLevel='withdrawn';p.alertLabel='⛔ RETIRÉ';}
     else if(p.dailyConsumption<=0&&p.yearlyExits<=0){p.alertLevel='dead';p.alertLabel='Inactif';}
     else if(p.daysRemaining<=0){p.alertLevel='rupture';p.alertLabel='RUPTURE';}
     else if(p.daysRemaining<=DB.settings.alert_rupture){p.alertLevel='5j';p.alertLabel=`≤${DB.settings.alert_rupture}j`;}
     else if(p.daysRemaining<=DB.settings.alert_securite){p.alertLevel='15j';p.alertLabel=`≤${DB.settings.alert_securite}j`;}
+    else if(belowReorderPoint||belowTarget){p.alertLevel='reorder';p.alertLabel='À réapprovisionner';}
     else if(p.daysRemaining>DB.settings.surstock){p.alertLevel='surstock';p.alertLabel='Surstock';}
     else{p.alertLevel='ok';p.alertLabel='OK';}
 
     // Risk score
     let risk=0;
-    if(p.daysRemaining<=0)risk+=30;else if(p.daysRemaining<=5)risk+=25;else if(p.daysRemaining<=15)risk+=15;else if(p.daysRemaining<=30)risk+=8;
+    if(p.daysRemaining<=0)risk+=30;else if(p.daysRemaining<=5)risk+=25;else if(p.daysRemaining<=15)risk+=15;else if(p.alertLevel==='reorder')risk+=10;else if(p.daysRemaining<=30)risk+=8;
     risk+=p.abc==='A'?25:p.abc==='B'?12:3;
     if(!p.dciCoverage||p.dciCoverage.count<=1)risk+=20;else if(p.dciCoverage.totalDays<15)risk+=12;else if(p.dciCoverage.totalDays<30)risk+=5;
     risk+=p.xyz==='Z'?15:p.xyz==='Y'?8:3;
@@ -872,7 +1026,9 @@ function computeAll(){
   });
 
   DB.products=products;DB.loaded=true;
-  persistSettings();
+  DB.lastComputedAt=new Date();          // U-8: track last compute timestamp
+  // U-1: persist parsed source data so we don't have to re-upload every session
+  persistImportedData().catch(()=>{});
   }catch(err){
     console.error('computeAll error:',err);
     alert('Erreur lors du calcul: '+err.message+'\nVérifiez vos fichiers importés.');
@@ -946,7 +1102,15 @@ function runCompute(){
   const prog=document.getElementById('importProgress');if(prog)prog.style.display='block';
   setTimeout(()=>{computeAll();if(prog)prog.style.display='none';updateBadges();renderImport(document.getElementById('mainContent'))},100);
 }
-function clearAll(){if(!confirm('Supprimer toutes les données ?'))return;DB.rotation=[];DB.monthly={};DB.nomenclature=[];DB.nationalDCI=[];DB.nationalDCI_all=[];DB.retraits=[];DB._withdrawnBrands=new Set();DB.products={};DB.suppliers={};DB.dciGroups={};DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};DB._dciGroups={};DB._categoryGroups={};DB._mergedProducts={};DB.uniqueDCINames=[];DB.clients=[];DB.importStatus={rotation:false,monthly:0,nomenclature:false,chifaDCI:false,retraits:0,clients:false};DB.loaded=false;localStorage.clear();idbClear().catch(()=>{});updateBadges();renderImport(document.getElementById('mainContent'));}
+// U-2: single button for the daily workflow — recompute + jump to dashboard
+function dailyUpdate(){
+  if(!DB.importStatus.nomenclature&&DB.importStatus.monthly===0){
+    alert('Importez d\'abord vos fichiers (Nomenclature + Fichiers mensuels).');
+    showPage('import');return;
+  }
+  computeAll();updateBadges();showPage('dashboard');
+}
+function clearAll(){if(!confirm('Supprimer toutes les données ?'))return;DB.rotation=[];DB.monthly={};DB.nomenclature=[];DB.nationalDCI=[];DB.nationalDCI_all=[];DB.retraits=[];DB._withdrawnBrands=new Set();DB.products={};DB.suppliers={};DB.dciGroups={};DB._brandIndex={};DB._byCode={};DB._dciDosageIndex={};DB._dciGroups={};DB._categoryGroups={};DB._mergedProducts={};DB.uniqueDCINames=[];DB.clients=[];DB.importStatus={rotation:false,monthly:0,nomenclature:false,chifaDCI:false,retraits:0,clients:false};DB.loaded=false;DB.lastComputedAt=null;localStorage.clear();idbClear().catch(()=>{});updateBadges();renderImport(document.getElementById('mainContent'));}
 function updateBadges(){if(!DB.loaded)return;const ps=Object.values(DB.products);const a=ps.filter(p=>['rupture','5j'].includes(p.alertLevel)).length;const e=ps.filter(p=>p.expiredQty>0||p.nearExpiryQty>0).length;const ab=document.getElementById('alertBadge'),eb=document.getElementById('expiryBadge'),db=document.getElementById('dciMatchBadge');if(ab){ab.textContent=a;ab.style.display=a>0?'inline':'none'}if(eb){eb.textContent=e;eb.style.display=e>0?'inline':'none'}
 // V4: DCI unmatched badge
 if(db){const unmatched=ps.filter(p=>p.alertLevel!=='dead'&&!p.dci&&!p.withdrawn).length;db.textContent=unmatched;db.style.display=unmatched>0?'inline':'none'}
@@ -963,9 +1127,12 @@ function renderDashboard(el){
   const budgetUrgent=ps.filter(p=>p.suggestedPurchase>0&&['rupture','5j','15j'].includes(p.alertLevel)&&!p.dciGroupCovered&&!p.withdrawn).reduce((a,p)=>a+p.purchaseCost,0);
   const classA=ps.filter(p=>p.abc==='A');
 
+  // U-2: top 5 urgent purchases to surface inline on dashboard
+  const urgentTop=ps.filter(p=>p.suggestedPurchase>0&&!p.dciGroupCovered&&!p.withdrawn&&!p.deferForExpiry&&['rupture','5j','15j','reorder'].includes(p.alertLevel))
+    .sort((a,b)=>b.riskScore-a.riskScore).slice(0,5);
   el.innerHTML=`
-    <h2 class="page-title">Tableau de Bord</h2>
-    <p class="page-subtitle">${fmt(active.length)} produits actifs — Stock depuis nomenclature ERP${DB.importStatus.chifaDCI?` — ${dciCovered} produits couverts par génériques`:''}</p>
+    <h2 class="page-title">Tableau de Bord <button class="btn btn-primary" style="float:right;padding:8px 18px;font-size:13px" onclick="dailyUpdate()">🔄 Mise à jour quotidienne</button></h2>
+    <p class="page-subtitle">${fmt(active.length)} produits actifs — Stock depuis nomenclature ERP${DB.importStatus.chifaDCI?` — ${dciCovered} produits couverts par génériques`:''}${lastComputeBadge()}</p>
     <div class="cards">
       <div class="card"><div class="card-label">Produits Actifs</div><div class="card-value">${fmt(active.length)}</div><div class="card-sub">sur ${fmt(ps.length)} total</div></div>
       <div class="card red"><div class="card-label">Ruptures</div><div class="card-value">${fmt(rup.length)}</div></div>
@@ -977,6 +1144,7 @@ function renderDashboard(el){
       ${withdrawn.length>0?`<div class="card"><div class="card-label">⛔ Retirés</div><div class="card-value" style="color:var(--text3)">${fmt(withdrawn.length)}</div><div class="card-sub">retirés du marché</div></div>`:''}
       <div class="card purple"><div class="card-label">Budget Urgents</div><div class="card-value" style="font-size:18px">${fmtDA(budgetUrgent)}</div><div class="card-sub">hors DCI & retraits</div></div>
     </div>
+    ${urgentTop.length>0?`<div class="table-wrap" style="margin-bottom:20px"><div style="padding:12px 16px;border-bottom:1px solid var(--bg3);display:flex;justify-content:space-between;align-items:center"><strong>🔥 Top 5 produits à commander en priorité</strong><a onclick="showPage('purchase')" style="cursor:pointer;color:var(--accent);font-size:13px">Voir la liste complète →</a></div><table><thead><tr><th>Produit</th><th>ABC</th><th>Stock</th><th>Jours</th><th>Alerte</th><th>Qté Sugg.</th><th>Coût</th><th>Fournisseur</th></tr></thead><tbody>${urgentTop.map(p=>`<tr onclick="showDetail('${escAttr(p.name)}')" style="cursor:pointer"><td title="${escHTML(p.name)}">${escTrunc(p.name,40)}</td><td><span class="abc-badge abc-${p.abc}">${p.abc}</span></td><td style="font-weight:600">${fmt(p.effectiveStock)}</td><td style="color:${p.daysRemaining<=5?'var(--red)':p.daysRemaining<=15?'var(--orange)':'var(--text)'}">${Math.round(p.daysRemaining)}j</td><td><span class="alert-badge alert-${p.alertLevel}">${p.alertLabel}</span></td><td style="font-weight:600">${fmt(p.suggestedPurchase)}</td><td style="font-weight:600">${fmtDA(p.purchaseCost)}</td><td style="font-size:12px">${escHTML(p.bestSupplier)||'-'}</td></tr>`).join('')}</tbody></table></div>`:''}
     <div class="charts-row">
       <div class="chart-box"><h3>Répartition des Alertes</h3><canvas id="cAlerts"></canvas></div>
       <div class="chart-box"><h3>Ventes Mensuelles</h3><canvas id="cMonthly"></canvas></div>
@@ -1006,17 +1174,18 @@ function renderAlerts(el){
     <p class="page-subtitle" id="alertsSubtitle"></p>
     <div class="table-wrap">
       <div class="table-toolbar">
-        <input id="alertsSearchInput" placeholder="🔍 Rechercher produit, DCI, labo..." value="${alertsFilter.search}" oninput="alertsFilter.search=this.value;alertsPage=0;updateAlertsTable()">
-        <select id="alertsLevelSelect" onchange="alertsFilter.level=this.value;alertsPage=0;updateAlertsTable()">
+        <input id="alertsSearchInput" placeholder="🔍 Rechercher produit, DCI, labo..." value="${alertsFilter.search}" oninput="alertsFilter.search=this.value;alertsPage=0;updateAlertsTable();persistUIFilters()">
+        <select id="alertsLevelSelect" onchange="alertsFilter.level=this.value;alertsPage=0;updateAlertsTable();persistUIFilters()">
           <option value="all"${alertsFilter.level==='all'?' selected':''}>Tous niveaux</option>
           <option value="rupture"${alertsFilter.level==='rupture'?' selected':''}>🔴 Rupture</option>
           <option value="5j"${alertsFilter.level==='5j'?' selected':''}>🟠 ≤${DB.settings.alert_rupture}j</option>
           <option value="15j"${alertsFilter.level==='15j'?' selected':''}>🟡 ≤${DB.settings.alert_securite}j</option>
+          <option value="reorder"${alertsFilter.level==='reorder'?' selected':''}>🟣 À réapprovisionner</option>
           <option value="ok"${alertsFilter.level==='ok'?' selected':''}>🟢 OK</option>
           <option value="surstock"${alertsFilter.level==='surstock'?' selected':''}>🔵 Surstock</option>
           <option value="withdrawn"${alertsFilter.level==='withdrawn'?' selected':''}>⛔ Retirés</option>
         </select>
-        <select id="alertsAbcSelect" onchange="alertsFilter.abc=this.value;alertsPage=0;updateAlertsTable()">
+        <select id="alertsAbcSelect" onchange="alertsFilter.abc=this.value;alertsPage=0;updateAlertsTable();persistUIFilters()">
           <option value="all">ABC</option><option value="A"${alertsFilter.abc==='A'?' selected':''}>A</option><option value="B"${alertsFilter.abc==='B'?' selected':''}>B</option><option value="C"${alertsFilter.abc==='C'?' selected':''}>C</option>
         </select>
       </div>
@@ -1041,7 +1210,7 @@ function updateAlertsTable(){
   else ps.sort((a,b)=>b.riskScore-a.riskScore);
   const tp=Math.max(1,Math.ceil(ps.length/ROWS));alertsPage=Math.min(alertsPage,tp-1);if(alertsPage<0)alertsPage=0;
   const page=ps.slice(alertsPage*ROWS,(alertsPage+1)*ROWS);
-  const sub=document.getElementById('alertsSubtitle');if(sub)sub.textContent=fmt(ps.length)+' produits — triés par score de risque';
+  const sub=document.getElementById('alertsSubtitle');if(sub)sub.innerHTML=fmt(ps.length)+' produits — triés par score de risque'+lastComputeBadge();
   const tbody=document.getElementById('alertsTableBody');
   if(tbody)tbody.innerHTML=page.map(p=>`<tr onclick="showDetail('${escAttr(p.name)}')" style="cursor:pointer${p.withdrawn?';opacity:.5;text-decoration:line-through':''}">
           <td><div class="risk-bar"><div class="risk-fill" style="width:${p.riskScore}%;background:${p.riskScore>=70?'#ef4444':p.riskScore>=50?'#f97316':p.riskScore>=30?'#eab308':'#22c55e'}"></div></div>${p.riskScore}</td>
@@ -1051,8 +1220,8 @@ function updateAlertsTable(){
           <td>${p.dailyConsumption>0?p.dailyConsumption.toFixed(1):'-'}</td>
           <td style="color:${p.daysRemaining<=5?'var(--red)':p.daysRemaining<=15?'var(--orange)':'var(--text)'}">${p.daysRemaining>9e3?'∞':Math.round(p.daysRemaining)+'j'}</td>
           <td><span class="alert-badge alert-${p.alertLevel}">${p.alertLabel}</span></td>
-          <td style="font-weight:${p.suggestedPurchase>0?'600':'400'}">${p.dciGroupCovered?'<span class="dci-group-badge dci-covered">DCI ✓</span>':p.suggestedPurchase>0?fmt(p.suggestedPurchase):'-'}</td>
-          <td>${p.dciGroupCovered?'-':p.purchaseCost>0?fmtDA(p.purchaseCost):'-'}</td>
+          <td style="font-weight:${p.suggestedPurchase>0?'600':'400'}">${p.dciGroupCovered?'<span class="dci-group-badge dci-covered">DCI ✓</span>':p.deferForExpiry?'<span class="dci-group-badge dci-partial" title="Stock proche péremption à écouler avant d\'acheter">⏸ Péremption</span>':p.suggestedPurchase>0?fmt(p.suggestedPurchase):'-'}</td>
+          <td>${p.dciGroupCovered||p.deferForExpiry?'-':p.purchaseCost>0?fmtDA(p.purchaseCost):'-'}</td>
           <td>${p.dci?`<span class="dci-group-badge ${p.dciGroupCovered?'dci-covered':p.dciGroupDays&&p.dciGroupDays<30?'dci-partial':'dci-alone'}" title="${escHTML(p.dci)} ${escHTML(p.matchedDosage)||''}">${p.dciGroupCount||1} gén. ${escHTML(p.matchedDosage)||''}${p.dciGroupDays!=null&&p.dciGroupDays<9e3?' '+Math.round(p.dciGroupDays)+'j':''}</span>`:'-'}</td>
           <td style="color:${p.trend>1.1?'var(--green)':p.trend<0.9?'var(--red)':'var(--text2)'}">${p.trend>1.1?'↑':p.trend<0.9?'↓':'→'} ${((p.trend-1)*100).toFixed(0)}%</td>
         </tr>`).join('');
@@ -1114,12 +1283,17 @@ function showDetail(name){
 
   document.getElementById('modalContent').innerHTML=`
     ${p.withdrawn?'<div style="padding:10px 16px;background:rgba(100,116,139,.15);border:1px solid rgba(100,116,139,.3);border-radius:6px;margin-bottom:12px;font-size:13px;color:#94a3b8"><strong>⛔ PRODUIT RETIRÉ DU MARCHÉ</strong> — Ce médicament a été retiré. Ne pas commander. Écouler le stock restant ou le retourner.</div>':''}
+    ${p.deferForExpiry?`<div style="padding:10px 16px;background:var(--orange-bg);border:1px solid rgba(249,115,22,.3);border-radius:6px;margin-bottom:12px;font-size:13px;color:var(--orange)"><strong>⏸ COMMANDE REPORTÉE — péremption proche</strong> — ${fmt(p.nearExpiryQty)} unités expirent dans 3 mois (couvrent +1 mois de consommation). Écoulez-les avant de réapprovisionner. Quantité suggérée si l'on ignore la péremption: ${fmt(p._suggestedPurchaseRaw||0)}.</div>`:''}
+    ${p._useSparsePath?'<div style="padding:8px 14px;background:rgba(168,85,247,.1);border-radius:6px;margin-bottom:12px;font-size:12px;color:var(--purple)">📊 Demande sporadique — prévision basée sur les mois actifs uniquement.</div>':''}
+    ${p._useNewProductPath?'<div style="padding:8px 14px;background:rgba(6,182,212,.1);border-radius:6px;margin-bottom:12px;font-size:12px;color:var(--cyan)">🌱 Produit récent — prévision basée sur l\'historique disponible.</div>':''}
     <div class="detail-grid">
       <div class="detail-stat"><div class="label">Stock Effectif</div><div class="value">${fmt(p.effectiveStock)}</div></div>
       <div class="detail-stat"><div class="label">Conso/jour</div><div class="value">${p.dailyConsumption.toFixed(1)}</div></div>
       <div class="detail-stat"><div class="label">Jours Restants</div><div class="value" style="color:${p.daysRemaining<=5?'var(--red)':p.daysRemaining<=15?'var(--orange)':'var(--green)'}">${p.daysRemaining>9e3?'∞':Math.round(p.daysRemaining)+'j'}</div></div>
       <div class="detail-stat"><div class="label">Stock Cible ${p._targetMonths||3}m</div><div class="value">${fmt(p.targetStock)}</div></div>
-      <div class="detail-stat"><div class="label">Qté à Commander</div><div class="value" style="color:var(--accent)">${p.withdrawn?'<span style="color:#94a3b8">⛔ Retiré</span>':p.dciGroupCovered?'<span style="color:var(--cyan)">DCI ✓</span>':fmt(p.suggestedPurchase)}</div></div>
+      <div class="detail-stat"><div class="label">Point Cmd (${p.leadTime||7}j)</div><div class="value" style="color:var(--orange)">${fmt(p.reorderPoint||0)}</div></div>
+      <div class="detail-stat"><div class="label">Stock Sécurité</div><div class="value">${fmt(p.safetyStock||0)}</div></div>
+      <div class="detail-stat"><div class="label">Qté à Commander</div><div class="value" style="color:var(--accent)">${p.withdrawn?'<span style="color:#94a3b8">⛔ Retiré</span>':p.dciGroupCovered?'<span style="color:var(--cyan)">DCI ✓</span>':p.deferForExpiry?'<span style="color:var(--orange)">⏸ Reportée</span>':fmt(p.suggestedPurchase)}</div></div>
       <div class="detail-stat"><div class="label">Classification</div><div class="value"><span class="abc-badge abc-${p.abc} xyz-${p.xyz}" style="font-size:14px;padding:3px 8px">${p.abc}${p.xyz}</span></div></div>
       <div class="detail-stat"><div class="label">Tendance</div><div class="value" style="color:${p.trend>1.1?'var(--green)':p.trend<0.9?'var(--red)':'var(--text2)'}">${p.trend>1.1?'↑':p.trend<0.9?'↓':'→'} ${((p.trend-1)*100).toFixed(0)}%</div></div>
       <div class="detail-stat"><div class="label">Risque</div><div class="value">${p.riskScore}/100</div></div>
@@ -1137,14 +1311,20 @@ function closeModal(){document.getElementById('productModal').classList.remove('
 document.getElementById('productModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal()});
 
 // ==================== SUPPLIERS PAGE ====================
-let supFilter={search:''},supTab='overview';
+let supFilter={search:'',compareSearch:''},supTab='overview';
 function renderSuppliers(el){
   if(!DB.loaded){el.innerHTML='<p style="padding:40px;text-align:center;color:var(--text3)">Importez les données d\'abord.</p>';return}
   let sups=Object.values(DB.suppliers);
   if(supFilter.search){const q=supFilter.search.toUpperCase();sups=sups.filter(s=>s.name.toUpperCase().includes(q))}
   sups.sort((a,b)=>b.totalSpend-a.totalSpend);
 
-  const multiSup=Object.values(DB.products).filter(p=>p.supplierCount>1).sort((a,b)=>b.yearlyExits-a.yearlyExits);
+  // U-4: now actually filters by product name from the compare-tab search input
+  let multiSup=Object.values(DB.products).filter(p=>p.supplierCount>1);
+  if(supTab==='compare'&&supFilter.compareSearch){
+    const q=supFilter.compareSearch.toUpperCase();
+    multiSup=multiSup.filter(p=>p.name.includes(q)||(p.dci&&p.dci.includes(q)));
+  }
+  multiSup.sort((a,b)=>b.yearlyExits-a.yearlyExits);
   const savings=multiSup.reduce((t,p)=>{
     if(!p._supSummaries||p._supSummaries.length<2)return t;
     return t+(p._supSummaries[1].latestPrice-p._supSummaries[0].latestPrice)*(p.yearlyExits/12);
@@ -1152,15 +1332,15 @@ function renderSuppliers(el){
 
   el.innerHTML=`
     <h2 class="page-title">Comparaison Fournisseurs</h2>
-    <p class="page-subtitle">${sups.length} fournisseurs — ${multiSup.length} produits multi-fournisseurs</p>
+    <p class="page-subtitle">${sups.length} fournisseurs — ${multiSup.length} produits multi-fournisseurs${lastComputeBadge()}</p>
     <div class="cards" style="margin-bottom:20px">
       <div class="card"><div class="card-label">Fournisseurs</div><div class="card-value">${sups.length}</div></div>
       <div class="card green"><div class="card-label">Produits Comparables</div><div class="card-value">${multiSup.length}</div></div>
       <div class="card purple"><div class="card-label">Économie Potentielle/mois</div><div class="card-value" style="font-size:18px">${fmtDA(savings)}</div></div>
     </div>
-    <div class="tabs"><div class="tab ${supTab==='overview'?'active':''}" onclick="supTab='overview';renderSuppliers(document.getElementById('mainContent'))">Fournisseurs</div><div class="tab ${supTab==='compare'?'active':''}" onclick="supTab='compare';renderSuppliers(document.getElementById('mainContent'))">Comparaison Prix</div></div>
-    ${supTab==='overview'?`<div class="table-wrap"><div class="table-toolbar"><input placeholder="🔍 Rechercher..." value="${supFilter.search}" oninput="supFilter.search=this.value;renderSuppliers(document.getElementById('mainContent'))"></div><div class="table-scroll"><table><thead><tr><th>Fournisseur</th><th>Produits</th><th>Commandes</th><th>Dépense Totale</th></tr></thead><tbody>${sups.map(s=>`<tr><td><strong>${escHTML(s.name)}</strong></td><td>${Object.keys(s.products).length}</td><td>${s.orderCount}</td><td>${fmtDA(s.totalSpend)}</td></tr>`).join('')}</tbody></table></div></div>`
-    :`<div class="table-wrap"><div class="table-toolbar"><input placeholder="🔍 Rechercher produit..." oninput="this.dataset.q=this.value;renderSuppliers(document.getElementById('mainContent'))"></div><div class="table-scroll"><table><thead><tr><th>Produit</th><th>Meilleur Prix</th><th>Date</th><th>Fournisseur</th><th>2ème Prix</th><th>Date</th><th>Fournisseur</th><th>Écart</th></tr></thead><tbody>${multiSup.slice(0,200).map(p=>{
+    <div class="tabs"><div class="tab ${supTab==='overview'?'active':''}" onclick="supTab='overview';renderSuppliers(document.getElementById('mainContent'));persistUIFilters()">Fournisseurs</div><div class="tab ${supTab==='compare'?'active':''}" onclick="supTab='compare';renderSuppliers(document.getElementById('mainContent'));persistUIFilters()">Comparaison Prix</div></div>
+    ${supTab==='overview'?`<div class="table-wrap"><div class="table-toolbar"><input placeholder="🔍 Rechercher..." value="${escAttr(supFilter.search)}" oninput="supFilter.search=this.value;renderSuppliers(document.getElementById('mainContent'));persistUIFilters()"></div><div class="table-scroll"><table><thead><tr><th>Fournisseur</th><th>Produits</th><th>Commandes</th><th>Dépense Totale</th></tr></thead><tbody>${sups.map(s=>`<tr><td><strong>${escHTML(s.name)}</strong></td><td>${Object.keys(s.products).length}</td><td>${s.orderCount}</td><td>${fmtDA(s.totalSpend)}</td></tr>`).join('')}</tbody></table></div></div>`
+    :`<div class="table-wrap"><div class="table-toolbar"><input placeholder="🔍 Rechercher produit, DCI..." value="${escAttr(supFilter.compareSearch||'')}" oninput="supFilter.compareSearch=this.value;renderSuppliers(document.getElementById('mainContent'));persistUIFilters()"></div><div class="table-scroll"><table><thead><tr><th>Produit</th><th>Meilleur Prix</th><th>Date</th><th>Fournisseur</th><th>2ème Prix</th><th>Date</th><th>Fournisseur</th><th>Écart</th></tr></thead><tbody>${multiSup.slice(0,200).map(p=>{
       if(!p._supSummaries||p._supSummaries.length<2)return'';
       const b=p._supSummaries[0],s2=p._supSummaries[1];
       const spread=b.latestPrice>0?((s2.latestPrice-b.latestPrice)/b.latestPrice*100).toFixed(0):'?';
@@ -1184,19 +1364,21 @@ function renderSuppliers(el){
 let purchaseMode='product',purchaseFilter='urgent';
 function renderPurchase(el){
   if(!DB.loaded){el.innerHTML='<p style="padding:40px;text-align:center;color:var(--text3)">Importez les données d\'abord.</p>';return}
-  // V3: Only show products WITHOUT available generics covering them
-  let ps=Object.values(DB.products).filter(p=>p.suggestedPurchase>0&&p.alertLevel!=='dead'&&!p.withdrawn&&!p.dciGroupCovered);
-  if(purchaseFilter==='urgent')ps=ps.filter(p=>['rupture','5j','15j'].includes(p.alertLevel));
+  // V5: Only show products WITHOUT available generics covering them AND not deferred for expiry
+  let ps=Object.values(DB.products).filter(p=>p.suggestedPurchase>0&&p.alertLevel!=='dead'&&!p.withdrawn&&!p.dciGroupCovered&&!p.deferForExpiry);
+  if(purchaseFilter==='urgent')ps=ps.filter(p=>['rupture','5j','15j','reorder'].includes(p.alertLevel));
   else if(purchaseFilter==='rupture')ps=ps.filter(p=>['rupture','5j'].includes(p.alertLevel));
   ps.sort((a,b)=>b.riskScore-a.riskScore);
   const total=ps.reduce((a,p)=>a+p.purchaseCost,0);
   const hiddenCount=Object.values(DB.products).filter(p=>p.dciGroupCovered&&p.suggestedPurchase>0).length;
+  // F-5: products deferred because near-expiry stock will cover the period
+  const deferredCount=Object.values(DB.products).filter(p=>p.deferForExpiry).length;
   // V3: Count products where ALL DCI generics are out of stock
   const noStockDCI=ps.filter(p=>p.dci&&p.dciGroupStock<=0&&p.allDCIGenerics&&p.allDCIGenerics.length>0);
 
   el.innerHTML=`
     <h2 class="page-title">Liste d'Achat</h2>
-    <p class="page-subtitle">Stock cible ${DB.settings.stock_cible} jours${hiddenCount>0?` — ${hiddenCount} produits masqués (DCI couverte par génériques)`:''}</p>
+    <p class="page-subtitle">Stock cible ${DB.settings.stock_cible} jours${hiddenCount>0?` — ${hiddenCount} produits masqués (DCI couverte par génériques)`:''}${deferredCount>0?` — ${deferredCount} reportés (péremption proche)`:''}${lastComputeBadge()}</p>
     <div class="export-bar">
       <div class="export-summary">${fmt(ps.length)} produits — <strong>${fmtDA(total)}</strong>${noStockDCI.length>0?` | <span style="color:var(--orange)">${noStockDCI.length} DCI sans stock → voir génériques</span>`:''}</div>
       <div>
@@ -1288,23 +1470,32 @@ function renderBySupplier(ps){
 }
 
 function exportPurchase(){
-  let ps=Object.values(DB.products).filter(p=>p.suggestedPurchase>0&&p.alertLevel!=='dead'&&!p.withdrawn&&!p.dciGroupCovered);
-  if(purchaseFilter==='urgent')ps=ps.filter(p=>['rupture','5j','15j'].includes(p.alertLevel));
+  let ps=Object.values(DB.products).filter(p=>p.suggestedPurchase>0&&p.alertLevel!=='dead'&&!p.withdrawn&&!p.dciGroupCovered&&!p.deferForExpiry);
+  if(purchaseFilter==='urgent')ps=ps.filter(p=>['rupture','5j','15j','reorder'].includes(p.alertLevel));
   else if(purchaseFilter==='rupture')ps=ps.filter(p=>['rupture','5j'].includes(p.alertLevel));
   ps.sort((a,b)=>b.riskScore-a.riskScore);
-  // V3: Added DCI, Dosage, Stock columns + Génériques Disponibles
-  const d=[['Produit','DCI','Dosage','ABC','Stock Actuel','Jours','Alerte','Risque','Qté à Commander','Meilleur Prix','Date Prix','Coût','Fournisseur','2ème Prix','2ème Fournisseur','Tendance','Génériques Disponibles']];
+  // V5: Added Lead Time + Reorder Point columns
+  const d=[['Produit','DCI','Dosage','ABC','Stock Actuel','Jours','Lead Time (j)','Point Cmd','Alerte','Risque','Qté à Commander','Meilleur Prix','Date Prix','Coût','Fournisseur','2ème Prix','2ème Fournisseur','Tendance','Génériques Disponibles']];
   ps.forEach(p=>{
-    const genList=p.allDCIGenerics&&p.allDCIGenerics.length>0?p.allDCIGenerics.map(g=>g.brand+' ('+g.labo+')').join(', '):'';
-    d.push([p.name,p.dci||'',p.matchedDosage||extractDosage(p.name)||'',p.abc+p.xyz,p.effectiveStock,Math.round(p.daysRemaining),p.alertLabel,p.riskScore,p.suggestedPurchase,p.bestPrice<Infinity?p.bestPrice:p.p_achat,p.bestPriceDate?p.bestPriceDate.toLocaleDateString('fr-FR'):'',p.purchaseCost,p.bestSupplier||'',p.secondBestPrice<Infinity?p.secondBestPrice:'',p.secondBestSupplier||'',((p.trend-1)*100).toFixed(0)+'%',genList]);
+    const genList=p.allDCIGenerics&&p.allDCIGenerics.length>0?p.allDCIGenerics.map(g=>g.brand+' ('+(g.labo||'?')+')').join(', '):'';
+    d.push([p.name,p.dci||'',p.matchedDosage||extractDosage(p.name)||'',p.abc+p.xyz,p.effectiveStock,Math.round(p.daysRemaining),p.leadTime||'',p.reorderPoint||'',p.alertLabel,p.riskScore,p.suggestedPurchase,p.bestPrice<Infinity?p.bestPrice:p.p_achat,p.bestPriceDate?p.bestPriceDate.toLocaleDateString('fr-FR'):'',p.purchaseCost,p.bestSupplier||'',p.secondBestPrice<Infinity?p.secondBestPrice:'',p.secondBestSupplier||'',((p.trend-1)*100).toFixed(0)+'%',genList]);
   });
   const wb=XLSX.utils.book_new();const ws=XLSX.utils.aoa_to_sheet(d);
-  ws['!cols']=[{wch:40},{wch:20},{wch:12},{wch:5},{wch:10},{wch:8},{wch:10},{wch:6},{wch:10},{wch:12},{wch:12},{wch:14},{wch:22},{wch:12},{wch:22},{wch:8},{wch:50}];
+  ws['!cols']=[{wch:40},{wch:20},{wch:12},{wch:5},{wch:10},{wch:8},{wch:8},{wch:8},{wch:10},{wch:6},{wch:10},{wch:12},{wch:12},{wch:14},{wch:22},{wch:12},{wch:22},{wch:8},{wch:50}];
   XLSX.utils.book_append_sheet(wb,ws,'Liste Achat');
   // Sheets per supplier
+  // U-7: dedupe truncated sheet names (Excel limits to 31 chars; same prefix would otherwise collide)
   const groups={};ps.forEach(p=>{const s=p.bestSupplier||'N-A';if(!groups[s])groups[s]=[];groups[s].push(p)});
+  const usedSheetNames=new Set(['Liste Achat']);
   Object.entries(groups).forEach(([sup,prods])=>{
-    const sn=sup.substring(0,31).replace(/[\\\/\*\?\[\]]/g,'');
+    let base=sup.substring(0,31).replace(/[\\\/\*\?\[\]:]/g,'');
+    let sn=base, i=1;
+    while(usedSheetNames.has(sn)){
+      const suffix=` (${i})`;
+      sn=base.substring(0,31-suffix.length)+suffix;
+      i++;
+    }
+    usedSheetNames.add(sn);
     const sd=[['Produit','DCI','Stock','Qté','P.Achat','Date','Total']];
     prods.forEach(p=>sd.push([p.name,p.dci||'',p.effectiveStock,p.suggestedPurchase,p.bestPrice<Infinity?p.bestPrice:p.p_achat,p.bestPriceDate?p.bestPriceDate.toLocaleDateString('fr-FR'):'',p.purchaseCost]));
     sd.push(['','','','','','TOTAL:',prods.reduce((a,p)=>a+p.purchaseCost,0)]);
@@ -1351,8 +1542,16 @@ function renderExpiry(el){
 
 // ==================== V4: DCI MATCHING PAGE ====================
 let dciFilter='all',dciSearch='';
+let dciSelected=new Set(); // U-3: products checked for bulk actions
 // V4.1: Predefined cosmétique/article categories
 const CATEGORIES_PREDEF=['Crème','Shampooing','Écran Solaire','Dentifrice','Lait Corporel','Déodorant','Maquillage','Complément Alimentaire','Hygiène Bébé','Accessoire','Autre'];
+// U-3: heuristic patterns suggesting a product is a cosmétique/article rather than a medicament
+const ARTICLE_KEYWORDS=['CREME','GEL','LAIT','SOIN','SAVON','SHAMP','DENT','MAQUI','VERN','PARFUM','DEODOR','HUILE','SERUM','MASQUE','BAUME','ECRAN','SOLAIRE','BIBERON','TETINE','LANGE','COUCHE','PAMPERS','SCOTCH','GAZE','COMPRESS','BANDE','SERVIETTE','MOUCHOIR','PAPIER','BROSSE','LIME','PINCETTE','THERMO','TEST','PRESERVATIF','BAVOIR','LINGETTE','POUDRE BEBE','VASELINE','SUCETTE','BOTTE'];
+function suggestIsArticle(name){
+  if(!name)return false;
+  const n=name.toUpperCase();
+  return ARTICLE_KEYWORDS.some(k=>n.includes(k));
+}
 
 // V4.1: Generic dropdown functions
 function filterDropdown(inputId,dropdownId,list,value){
@@ -1379,7 +1578,7 @@ function renderDCIMatch(el){
   const categorized=ps.filter(p=>p.manualCategory);
   el.innerHTML=`
     <h2 class="page-title">Matching DCI & Catégories</h2>
-    <p class="page-subtitle">Attribuez les DCI (médicaments) et catégories (articles/cosmétiques)</p>
+    <p class="page-subtitle">Attribuez les DCI (médicaments) et catégories (articles/cosmétiques)${lastComputeBadge()}</p>
     <div class="cards">
       <div class="card green"><div class="card-label">Matchés Auto</div><div class="card-value">${matched.length}</div></div>
       <div class="card red"><div class="card-label">Non Matchés</div><div class="card-value">${unmatched.length}</div></div>
@@ -1394,13 +1593,23 @@ function renderDCIMatch(el){
     </div>
     <div class="table-wrap">
       <div class="table-toolbar">
-        <input id="dciSearchInput" placeholder="🔍 Rechercher produit, DCI, catégorie..." value="${dciSearch}" oninput="dciSearch=this.value;updateDCITable()">
+        <input id="dciSearchInput" placeholder="🔍 Rechercher produit, DCI, catégorie..." value="${dciSearch}" oninput="dciSearch=this.value;updateDCITable();persistUIFilters()">
         <button class="btn btn-secondary" onclick="exportCorrections()">📥 Exporter Corrections</button>
         <button class="btn btn-secondary" onclick="document.getElementById('corrImport').click()">📤 Importer Corrections</button>
         <input type="file" id="corrImport" class="hidden-input" accept=".json" onchange="importCorrections(this.files[0])">
       </div>
-      <div class="table-scroll" style="max-height:calc(100vh - 420px)"><table>
-        <thead><tr><th>Produit</th><th>DCI Auto</th><th>Dosage</th><th>Confiance</th><th>Correction DCI / Catégorie</th><th>Dosage (opt.)</th><th>Action</th></tr></thead>
+      <!-- U-3: bulk action bar (visible when at least 1 row selected) -->
+      <div id="dciBulkBar" style="display:none;padding:10px 16px;border-bottom:1px solid var(--bg3);background:rgba(168,85,247,.08);align-items:center;gap:12px">
+        <span id="dciBulkCount" style="font-weight:600;color:var(--purple)"></span>
+        <button class="btn btn-primary" onclick="bulkMarkAsArticle()">🏷️ Marquer comme Article</button>
+        <button class="btn btn-secondary" onclick="bulkClearSelection()">Désélectionner</button>
+        <button class="btn btn-secondary" onclick="bulkSuggestArticles()" title="Présélectionne les produits dont le nom évoque un article (crème, gel, lait, soin…)">✨ Auto-suggérer Articles</button>
+      </div>
+      <div class="table-scroll" style="max-height:calc(100vh - 460px)"><table>
+        <thead><tr>
+          <th style="width:30px"><input type="checkbox" id="dciSelectAll" onclick="toggleAllDCISelection(this.checked)"></th>
+          <th>Produit</th><th>DCI Auto</th><th>Dosage</th><th>Confiance</th><th>Correction DCI / Catégorie</th><th>Dosage (opt.)</th><th>Action</th>
+        </tr></thead>
         <tbody id="dciTableBody"></tbody>
       </table></div>
     </div>`;
@@ -1415,13 +1624,17 @@ function updateDCITable(){
   ps.sort((a,b)=>(!a.dci&&!a.manualCategory?-1:!b.dci&&!b.manualCategory?1:0)||(b.riskScore-a.riskScore));
   const tbody=document.getElementById('dciTableBody');if(!tbody)return;
   const allCats=[...new Set([...CATEGORIES_PREDEF,...(DB.manualCategories||[])])].sort();
-  tbody.innerHTML=ps.slice(0,200).map(p=>{
+  // Cap to 200 to keep DOM light
+  const visible=ps.slice(0,200);
+  // Make a stable lookup of visible names so bulk actions can apply only to filtered view
+  window._dciVisible=visible.map(p=>p.name);
+  tbody.innerHTML=visible.map(p=>{
     const key=btoa(encodeURIComponent(p.name)).replace(/=/g,'');
     const corr=DB.manualDCI[p.name]||{};
+    const isChecked=dciSelected.has(p.name);
     const conf=p.manualCategory?'<span class="dci-confidence dci-manual">✦ Article</span>':p.manualDCI?'<span class="dci-confidence dci-manual">✎ Manuel</span>':p.dci?'<span class="dci-confidence dci-exact">✓ Auto</span>':'<span class="dci-confidence dci-none">✗ Aucun</span>';
     const ddId='dd_'+key;
     const inpId='dci_'+key;
-    // All products get the DCI dropdown from Chifa AI database
     const dciList='DB.uniqueDCINames';
     const ddField=`<div class="dci-autocomplete"><input id="${inpId}" value="${escAttr(corr.dci||'')}" placeholder="${escAttr(p.dci||'Chercher DCI...')}" class="dci-input" autocomplete="off"
       oninput="filterDropdown('${inpId}','${ddId}',${dciList},this.value)"
@@ -1429,6 +1642,7 @@ function updateDCITable(){
       onblur="setTimeout(()=>closeDropdown('${ddId}'),200)"${p.manualCategory?' disabled style="opacity:.4"':''}>
       <div id="${ddId}" class="dci-dropdown"></div></div>`;
     return`<tr>
+      <td><input type="checkbox" class="dciRowCheck" data-name="${escAttr(p.name)}" ${isChecked?'checked':''} onchange="toggleDCISelection('${escAttr(p.name)}',this.checked)"></td>
       <td title="${escHTML(p.name)}">${escTrunc(p.name,35)}</td>
       <td style="font-size:11px">${p.manualCategory?'<span class="cat-badge">'+escHTML(p.manualCategory)+'</span>':p.dci?escHTML(p.dci):'<span style="color:var(--red)">—</span>'}</td>
       <td style="font-size:11px">${escHTML(p.matchedDosage)||extractDosage(p.name)||'-'}</td>
@@ -1437,6 +1651,42 @@ function updateDCITable(){
       <td><input id="dos_${key}" value="${escAttr(corr.dosage||'')}" placeholder="${escAttr(p.matchedDosage||extractDosage(p.name)||'opt.')}" style="background:var(--bg);border:1px solid var(--bg3);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;width:80px"></td>
       <td>${p.manualCategory==='Article'?`<span class="cat-badge">Article</span> <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:`<button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="saveDCICorrection('${escAttr(p.name)}')">💾</button> <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="markAsArticle('${escAttr(p.name)}')">🏷️ Article</button>${corr.dci||corr.category?` <button class="btn btn-secondary" style="padding:3px 8px;font-size:11px" onclick="deleteDCICorrection('${escAttr(p.name)}')">✗</button>`:''}`}</td>
     </tr>`}).join('');
+  refreshDCIBulkBar();
+}
+// U-3: bulk selection helpers
+function toggleDCISelection(name,checked){if(checked)dciSelected.add(name);else dciSelected.delete(name);refreshDCIBulkBar();}
+function toggleAllDCISelection(checked){(window._dciVisible||[]).forEach(n=>{if(checked)dciSelected.add(n);else dciSelected.delete(n);});updateDCITable();}
+function bulkClearSelection(){dciSelected.clear();updateDCITable();}
+function refreshDCIBulkBar(){
+  const bar=document.getElementById('dciBulkBar');if(!bar)return;
+  const c=document.getElementById('dciBulkCount');
+  if(dciSelected.size===0){bar.style.display='none';return;}
+  bar.style.display='flex';
+  if(c)c.textContent=`${dciSelected.size} produit(s) sélectionné(s)`;
+}
+function bulkMarkAsArticle(){
+  if(dciSelected.size===0)return;
+  if(!confirm(`Marquer ${dciSelected.size} produit(s) comme Article ?`))return;
+  dciSelected.forEach(name=>{
+    DB.manualDCI[name]={category:'Article'};
+    const p=DB.products[name];
+    if(p){p.manualCategory='Article';p.category='parapharm';p.manualDCI=true;}
+  });
+  persistDCICorrections();
+  dciSelected.clear();
+  updateBadges();
+  renderDCIMatch(document.getElementById('mainContent'));
+}
+function bulkSuggestArticles(){
+  // Pre-select products in the current filtered view whose name evokes a parapharm article
+  let added=0;
+  (window._dciVisible||[]).forEach(name=>{
+    const p=DB.products[name];if(!p)return;
+    if(p.dci||p.manualCategory)return;
+    if(suggestIsArticle(name)){dciSelected.add(name);added++;}
+  });
+  alert(`${added} produit(s) pré-sélectionné(s) (mots-clés: crème, gel, lait, savon, etc.). Vérifiez et cliquez sur "Marquer comme Article".`);
+  updateDCITable();
 }
 function saveDCICorrection(name){
   const key=btoa(encodeURIComponent(name)).replace(/=/g,'');
@@ -1645,8 +1895,26 @@ function renderSettings(el){
         ${['medicament','parapharm','dispositif','autre'].map(c=>`<div class="setting-row"><label>${{medicament:'Médicaments',parapharm:'Parapharmacie',dispositif:'Dispositifs',autre:'Autre'}[c]}</label><input type="number" value="${s.growth_categories[c]}" onchange="DB.settings.growth_categories['${c}']=Number(this.value);persistSettings()">%</div>`).join('')}
       </div>
       <div class="setting-group"><h3>📦 Stock Cible par Classification (mois)</h3>
-        <p style="font-size:11px;color:var(--text3);margin-bottom:12px">Nombre de mois de stock cible selon ABC/XYZ. A=forte valeur, C=faible. X=stable, Z=erratique.</p>
-        ${['AX','AY','AZ','BX','BY','BZ','CX','CY','CZ'].map(k=>`<div class="setting-row"><label>${k}</label><input type="number" step="0.5" min="0.5" max="6" value="${s.targetMonths?s.targetMonths[k]:{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1}[k]}" onchange="if(!DB.settings.targetMonths)DB.settings.targetMonths={AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1};DB.settings.targetMonths['${k}']=Number(this.value);persistSettings()"> mois</div>`).join('')}
+        <p style="font-size:11px;color:var(--text3);margin-bottom:12px">Nombre de mois de stock cible selon ABC/XYZ. A=forte valeur, C=faible. X=stable, Z=erratique. <strong>Z = plus de stock</strong> (sécurité face à la variabilité).</p>
+        ${['AX','AY','AZ','BX','BY','BZ','CX','CY','CZ'].map(k=>`<div class="setting-row"><label>${k}</label><input type="number" step="0.5" min="0.5" max="6" value="${s.targetMonths?s.targetMonths[k]:DEFAULT_TARGET_MONTHS[k]}" onchange="if(!DB.settings.targetMonths)DB.settings.targetMonths={...DEFAULT_TARGET_MONTHS};DB.settings.targetMonths['${k}']=Number(this.value);persistSettings()"> mois</div>`).join('')}
+      </div>
+      <div class="setting-group"><h3>🚚 Délais Fournisseurs (jours)</h3>
+        <p style="font-size:11px;color:var(--text3);margin-bottom:12px">Délai de livraison pour calculer le point de réapprovisionnement.</p>
+        <div class="setting-row"><label><strong>Délai par défaut</strong></label><input type="number" min="1" max="60" value="${s.lead_time_default||7}" onchange="DB.settings.lead_time_default=Number(this.value);persistSettings()"> jours</div>
+        <div style="margin-top:12px;font-size:12px;color:var(--text2)">Par fournisseur (laisser vide = délai par défaut):</div>
+        <div style="max-height:260px;overflow-y:auto;margin-top:6px">
+          ${Object.keys(DB.suppliers||{}).sort().map(sn=>{
+            const v=(s.supplierLeadTimes||{})[sn]||'';
+            const safeAttr=escAttr(sn);
+            return `<div class="setting-row"><label style="font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHTML(sn)}">${escTrunc(sn,28)}</label><input type="number" min="1" max="60" value="${v}" placeholder="${s.lead_time_default||7}" onchange="updateSupplierLeadTime('${safeAttr}',this.value)" style="width:60px"> j</div>`;
+          }).join('')||'<p style="font-size:11px;color:var(--text3)">Aucun fournisseur — importez d\'abord vos fichiers mensuels.</p>'}
+        </div>
+      </div>
+      <div class="setting-group"><h3>🔮 Paramètres Prévision</h3>
+        <p style="font-size:11px;color:var(--text3);margin-bottom:12px">Réglages avancés du moteur de prévision.</p>
+        <div class="setting-row"><label>Seuil "demande sporadique" (mois actifs)</label><input type="number" min="1" max="12" value="${s.sparse_demand_threshold||5}" onchange="DB.settings.sparse_demand_threshold=Number(this.value);persistSettings()"></div>
+        <div class="setting-row"><label>Seuil "nouveau produit" (mois d'historique)</label><input type="number" min="1" max="13" value="${s.new_product_threshold||6}" onchange="DB.settings.new_product_threshold=Number(this.value);persistSettings()"></div>
+        <div class="setting-row"><label>Alerte sous % du stock cible</label><input type="number" min="0.1" max="1" step="0.05" value="${s.reorder_alert_factor||0.8}" onchange="DB.settings.reorder_alert_factor=Number(this.value);persistSettings()"> (0.8 = alerte si stock &lt; 80% cible)</div>
       </div>
       <div class="setting-group"><h3>🔄 Actions</h3>
         <div style="display:flex;gap:12px;flex-wrap:wrap">
@@ -1656,6 +1924,15 @@ function renderSettings(el){
         </div>
       </div>
     </div>`;
+}
+
+// F-6: per-supplier lead-time setter
+function updateSupplierLeadTime(supplier,value){
+  if(!DB.settings.supplierLeadTimes)DB.settings.supplierLeadTimes={};
+  const n=Number(value);
+  if(!value||isNaN(n)||n<=0)delete DB.settings.supplierLeadTimes[supplier];
+  else DB.settings.supplierLeadTimes[supplier]=n;
+  persistSettings();
 }
 
 function exportReport(){
@@ -1743,6 +2020,69 @@ function persistCategories(){
   localStorage.setItem('leghrib_pharmacy_categories',data);
   idbSet('manualCategories',DB.manualCategories).catch(()=>{});
 }
+// U-6: persist UI filter state so navigating between pages keeps your filter intact
+function persistUIFilters(){
+  try{
+    DB.uiFilters={alerts:alertsFilter,dci:{filter:dciFilter,search:dciSearch},
+      supplier:supFilter,supTab,purchaseMode,purchaseFilter,expiryTab,
+      clients:clientsFilter,sortCol,sortDir};
+    localStorage.setItem('leghrib_pharmacy_ui_filters',JSON.stringify(DB.uiFilters));
+  }catch(e){}
+}
+function restoreUIFilters(){
+  try{
+    const raw=localStorage.getItem('leghrib_pharmacy_ui_filters');
+    if(!raw)return;
+    const f=JSON.parse(raw);
+    if(f.alerts)Object.assign(alertsFilter,f.alerts);
+    if(f.dci){dciFilter=f.dci.filter||'all';dciSearch=f.dci.search||'';}
+    if(f.supplier)Object.assign(supFilter,f.supplier);
+    if(f.supTab)supTab=f.supTab;
+    if(f.purchaseMode)purchaseMode=f.purchaseMode;
+    if(f.purchaseFilter)purchaseFilter=f.purchaseFilter;
+    if(f.expiryTab)expiryTab=f.expiryTab;
+    if(f.clients)Object.assign(clientsFilter,f.clients);
+    if(f.sortCol!==undefined)sortCol=f.sortCol;
+    if(f.sortDir)sortDir=f.sortDir;
+  }catch(e){}
+}
+// U-1: Persist parsed raw data so it survives a browser reload. Only IndexedDB (too large for localStorage).
+async function persistImportedData(){
+  try{
+    const snapshot={
+      nomenclature:DB.nomenclature,
+      monthly:DB.monthly,
+      nationalDCI:DB.nationalDCI,
+      nationalDCI_all:DB.nationalDCI_all,
+      rotation:DB.rotation,
+      clients:DB.clients,
+      retraits:DB.retraits,
+      importStatus:DB.importStatus,
+      lastComputedAt:DB.lastComputedAt,
+    };
+    await idbSet('importedData',snapshot);
+  }catch(e){console.warn('persistImportedData failed',e);}
+}
+async function restoreImportedData(){
+  try{
+    const snap=await idbGet('importedData');
+    if(!snap)return false;
+    if(snap.nomenclature)DB.nomenclature=snap.nomenclature;
+    if(snap.monthly)DB.monthly=snap.monthly;
+    if(snap.nationalDCI)DB.nationalDCI=snap.nationalDCI;
+    if(snap.nationalDCI_all)DB.nationalDCI_all=snap.nationalDCI_all;
+    if(snap.rotation)DB.rotation=snap.rotation;
+    if(snap.clients)DB.clients=snap.clients;
+    if(snap.retraits){DB.retraits=snap.retraits;DB._withdrawnBrands=new Set();
+      snap.retraits.forEach(r=>{DB._withdrawnBrands.add(r.brand);DB._withdrawnBrands.add(r.brand.split(/\s+/)[0]);
+        if(r.dosage)DB._withdrawnBrands.add(r.brand+'|'+normalizeDosage(r.dosage));});}
+    if(snap.importStatus)DB.importStatus=snap.importStatus;
+    if(snap.lastComputedAt)DB.lastComputedAt=new Date(snap.lastComputedAt);
+    // Rebuild ephemeral indexes from nationalDCI
+    if(DB.nationalDCI&&DB.nationalDCI.length>0)buildDCIIndex();
+    return true;
+  }catch(e){console.warn('restoreImportedData failed',e);return false;}
+}
 
 // ==================== INIT ====================
 async function initApp(){
@@ -1755,7 +2095,7 @@ async function initApp(){
     ]);
     // Settings
     const settings=idbSettings||(() => {try{const s=localStorage.getItem('leghrib_pharmacy_settings');return s?JSON.parse(s):null}catch(e){return null}})();
-    if(settings){Object.assign(DB.settings,settings);if(settings.targetMonths)DB.settings.targetMonths={...{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1},...settings.targetMonths};}
+    if(settings){Object.assign(DB.settings,settings);if(settings.targetMonths)DB.settings.targetMonths={...DEFAULT_TARGET_MONTHS,...settings.targetMonths};}
     // DCI corrections
     const dci=idbDCI||(()=>{try{const mc=localStorage.getItem('leghrib_pharmacy_dci_corrections');return mc?JSON.parse(mc):null}catch(e){return null}})();
     if(dci)DB.manualDCI=dci;
@@ -1768,9 +2108,17 @@ async function initApp(){
     if(!idbCats&&cats)idbSet('manualCategories',cats).catch(()=>{});
   }catch(e){
     // Pure localStorage fallback
-    try{const s=localStorage.getItem('leghrib_pharmacy_settings');if(s){const parsed=JSON.parse(s);Object.assign(DB.settings,parsed);if(parsed.targetMonths)DB.settings.targetMonths={...{AX:3,AY:2.5,AZ:2,BX:2.5,BY:2,BZ:1.5,CX:2,CY:1.5,CZ:1},...parsed.targetMonths};}}catch(e2){}
+    try{const s=localStorage.getItem('leghrib_pharmacy_settings');if(s){const parsed=JSON.parse(s);Object.assign(DB.settings,parsed);if(parsed.targetMonths)DB.settings.targetMonths={...DEFAULT_TARGET_MONTHS,...parsed.targetMonths};}}catch(e2){}
     try{const mc=localStorage.getItem('leghrib_pharmacy_dci_corrections');if(mc)DB.manualDCI=JSON.parse(mc)}catch(e2){}
     try{const cats=localStorage.getItem('leghrib_pharmacy_categories');if(cats)DB.manualCategories=JSON.parse(cats)}catch(e2){}
+  }
+  // U-6: restore UI filter state
+  restoreUIFilters();
+  // U-1: restore previously imported source data (no need to re-upload Excels every session)
+  const restored=await restoreImportedData();
+  if(restored&&(DB.importStatus.nomenclature||DB.importStatus.monthly>0||DB.importStatus.chifaDCI)){
+    computeAll();
+    updateBadges();
   }
   showPage('import');
 }
